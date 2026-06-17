@@ -1,7 +1,18 @@
-from fastapi import FastAPI 
+from fastapi import FastAPI
+from pydantic import BaseModel
+from app.database import engine
 
 app = FastAPI()
 
+class Transaction(BaseModel):
+    symbol: str
+    quantity: int
+    price: float
+
 @app.get("/")
-def home(): 
+def home():
     return {"message": "HarvestIQ running"}
+
+@app.post("/transactions")
+def create_transaction(transaction: Transaction):
+    return transaction
