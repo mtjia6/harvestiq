@@ -2,6 +2,7 @@ from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy import Integer, String, Float
 
+
 class Base(DeclarativeBase):
     pass
 
@@ -18,3 +19,11 @@ class TransactionDB(Base):
     price: Mapped[float] = mapped_column(Float)
 
     transaction_type: Mapped[str] = mapped_column(String)
+
+    trade_date: Mapped[str] = mapped_column(String)
+
+    broker: Mapped[str] = mapped_column(String)
+
+    fees: Mapped[float] = mapped_column(Float)
+
+    currency: Mapped[str] = mapped_column(String)
