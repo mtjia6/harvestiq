@@ -12,6 +12,7 @@ class Transaction(BaseModel):
     symbol: str
     quantity: int
     price: float
+    transaction_type: str
 
 @app.get("/")
 def home():
@@ -25,7 +26,8 @@ def create_transaction(
     db_transaction = TransactionDB(
         symbol=transaction.symbol,
         quantity=transaction.quantity,
-        price=transaction.price
+        price=transaction.price,
+        transaction_type=transaction.transaction_type
     )
 
     db.add(db_transaction)
@@ -39,3 +41,23 @@ def get_transactions(
 ):
     transactions = db.query(TransactionDB).all()
     return transactions
+
+@app.get("/portfolio")
+def get_portfolio(
+    db: Session = Depends(get_db)
+):
+    transactions = db.query(TransactionDB).all()
+
+    holdings = {}
+
+    for transaction in transactions:
+
+        if transaction.symbol not in holdings:
+            holdings[transaction.symbol] = 0
+
+        if transaction.transaction_type == "BUY":
+            holdings[transaction.symbol] += transaction.quantity
+        else:
+            holdings[transaction.symbol] -= transaction.quantity
+
+    return holdings

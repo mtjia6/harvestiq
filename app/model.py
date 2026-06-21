@@ -16,3 +16,5 @@ class TransactionDB(Base):
     quantity: Mapped[int] = mapped_column(Integer)
 
     price: Mapped[float] = mapped_column(Float)
+
+    transaction_type: Mapped[str] = mapped_column(String)
