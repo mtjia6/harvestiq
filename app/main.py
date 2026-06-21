@@ -32,3 +32,10 @@ def create_transaction(
     db.commit()
 
     return {"message": "Transaction saved"}
+
+@app.get("/transactions")
+def get_transactions(
+    db: Session = Depends(get_db)
+):
+    transactions = db.query(TransactionDB).all()
+    return transactions
