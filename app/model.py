@@ -42,3 +42,17 @@ class TaxLotDB(Base):
     cost_basis_per_unit: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
     opened_date: Mapped[datetime.date] = mapped_column(Date)
     status: Mapped[str] = mapped_column(String)
+
+class RealizedGainDB(Base):
+    __tablename__ = "realized_gains"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String)
+    sell_transaction_id: Mapped[int] = mapped_column(ForeignKey("transactions.id"))
+    lot_id: Mapped[int] = mapped_column(ForeignKey("tax_lots.id"))
+    quantity_sold: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
+    proceeds: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
+    cost_basis: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
+    gain_loss: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
+    term: Mapped[str] = mapped_column(String)
+    sell_date: Mapped[datetime.date] = mapped_column(Date)

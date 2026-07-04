@@ -6,7 +6,7 @@ from datetime import date
 from decimal import Decimal
 
 from app.database import get_db
-from app.model import TransactionDB, SecurityDB, TaxLotDB
+from app.model import TransactionDB, SecurityDB, TaxLotDB, RealizedGainDB
 
 app = FastAPI()
 
@@ -101,13 +101,35 @@ def create_transaction(
 
             if lot.quantity_remaining <= quantity_to_sell:
                 # sell this entire lot
-                quantity_to_sell -= lot.quantity_remaining
+                quantity_sold = lot.quantity_remaining
                 lot.quantity_remaining = 0
                 lot.status = "closed"
             else:
                 # sell part of this lot
+                quantity_sold = quantity_to_sell
                 lot.quantity_remaining -= quantity_to_sell
-                quantity_to_sell = 0
+
+            quantity_to_sell -= quantity_sold
+
+            proceeds = quantity_sold * transaction.price
+            cost_basis = quantity_sold * lot.cost_basis_per_unit
+            gain_loss = proceeds - cost_basis
+
+            holding_days = (transaction.trade_date - lot.opened_date).days
+            term = "long" if holding_days > 365 else "short"
+
+            realized = RealizedGainDB(
+                symbol=transaction.symbol,
+                sell_transaction_id=db_transaction.id,
+                lot_id=lot.id,
+                quantity_sold=quantity_sold,
+                proceeds=proceeds,
+                cost_basis=cost_basis,
+                gain_loss=gain_loss,
+                term=term,
+                sell_date=transaction.trade_date,
+            )
+            db.add(realized)
 
         db.commit()
 
@@ -145,6 +167,10 @@ def get_portfolio(
 @app.get("/tax-lots")
 def get_tax_lots(db: Session = Depends(get_db)):
     return db.query(TaxLotDB).all()
+
+@app.get("/realized-gains")
+def get_realized_gains(db: Session = Depends(get_db)):
+    return db.query(RealizedGainDB).all()
 
 class Security(BaseModel):
     symbol: str = Field(min_length=1)
