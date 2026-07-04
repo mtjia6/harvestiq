@@ -10,6 +10,9 @@ from app.model import TransactionDB, SecurityDB, TaxLotDB, RealizedGainDB
 
 app = FastAPI()
 
+SHORT_TERM_TAX_RATE = Decimal("0.40")  # default: ~35% federal + ~5% GA
+LONG_TERM_TAX_RATE = Decimal("0.20")   # default: ~15% federal + ~5% GA
+
 
 class Transaction(BaseModel):
     symbol: str = Field(min_length=1)
@@ -280,3 +283,75 @@ def get_wash_sales(db: Session = Depends(get_db)):
         })
 
     return results
+
+@app.get("/harvest-opportunities")
+def get_harvest_opportunities(
+    short_term_rate: Decimal = SHORT_TERM_TAX_RATE,
+    long_term_rate: Decimal = LONG_TERM_TAX_RATE,
+    db: Session = Depends(get_db),
+):
+    open_lots = (
+        db.query(TaxLotDB)
+        .filter(TaxLotDB.status == "open")
+        .all()
+    )
+
+    today = date.today()
+    opportunities = []
+
+    for lot in open_lots:
+        security = (
+            db.query(SecurityDB)
+            .filter(SecurityDB.symbol == lot.symbol)
+            .first()
+        )
+        if security is None or security.latest_price is None:
+            continue
+
+        market_value = lot.quantity_remaining * security.latest_price
+        cost_basis = lot.quantity_remaining * lot.cost_basis_per_unit
+        unrealized = market_value - cost_basis
+
+        # only losses can be harvested
+        if unrealized >= 0:
+            continue
+
+        holding_days = (today - lot.opened_date).days
+        if holding_days > 365:
+            term = "long"
+            tax_rate = long_term_rate
+        else:
+            term = "short"
+            tax_rate = short_term_rate
+
+        # unrealized is negative, so -unrealized is the size of the loss
+        estimated_tax_savings = -unrealized * tax_rate
+
+        # would selling today be a wash sale? check for a buy in the last 30 days
+        window_start = today - timedelta(days=30)
+        recent_buy = (
+            db.query(TransactionDB)
+            .filter(TransactionDB.symbol == lot.symbol)
+            .filter(TransactionDB.transaction_type == "BUY")
+            .filter(TransactionDB.trade_date >= window_start)
+            .first()
+        )
+        wash_sale_risk = recent_buy is not None
+
+        opportunities.append({
+            "lot_id": lot.id,
+            "symbol": lot.symbol,
+            "quantity_remaining": lot.quantity_remaining,
+            "cost_basis": cost_basis,
+            "market_value": market_value,
+            "unrealized_loss": unrealized,
+            "term": term,
+            "estimated_tax_savings": estimated_tax_savings,
+            "wash_sale_risk": wash_sale_risk,
+            "recommended": not wash_sale_risk,
+        })
+
+    # best opportunities first
+    opportunities.sort(key=lambda o: o["estimated_tax_savings"], reverse=True)
+
+    return opportunities
