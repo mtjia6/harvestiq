@@ -6,7 +6,7 @@ from datetime import date
 from decimal import Decimal
 
 from app.database import get_db
-from app.model import TransactionDB, SecurityDB
+from app.model import TransactionDB, SecurityDB, TaxLotDB
 
 app = FastAPI()
 
@@ -56,6 +56,23 @@ def create_transaction(
 
     db.add(db_transaction)
     db.commit()
+    db.refresh(db_transaction)
+
+    if transaction.transaction_type == "BUY":
+        total_cost = transaction.price * transaction.quantity + transaction.fees
+        cost_basis_per_unit = total_cost / transaction.quantity
+
+        lot = TaxLotDB(
+            symbol=transaction.symbol,
+            open_transaction_id=db_transaction.id,
+            quantity_opened=transaction.quantity,
+            quantity_remaining=transaction.quantity,
+            cost_basis_per_unit=cost_basis_per_unit,
+            opened_date=transaction.trade_date,
+            status="open",
+        )
+        db.add(lot)
+        db.commit()
 
     return {"message": "Transaction saved"}
 
@@ -90,10 +107,8 @@ def get_portfolio(
 
 
 @app.get("/tax-lots")
-def get_tax_lots(
-    db: Session = Depends(get_db)
-):
-    return {"message": "not implemented yet"}
+def get_tax_lots(db: Session = Depends(get_db)):
+    return db.query(TaxLotDB).all()
 
 class Security(BaseModel):
     symbol: str = Field(min_length=1)
