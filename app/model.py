@@ -3,6 +3,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy import Integer, String, Numeric, Date, ForeignKey
 import datetime
 import decimal
+from typing import Optional
 
 
 class Base(DeclarativeBase):
@@ -30,6 +31,7 @@ class SecurityDB(Base):
     name: Mapped[str] = mapped_column(String)
     asset_class: Mapped[str] = mapped_column(String)
     currency: Mapped[str] = mapped_column(String)
+    latest_price: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(20, 8), nullable=True)
 
 class TaxLotDB(Base):
     __tablename__ = "tax_lots"

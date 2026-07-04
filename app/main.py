@@ -195,3 +195,55 @@ def create_security(security: Security, db: Session = Depends(get_db)):
 @app.get("/securities")
 def get_securities(db: Session = Depends(get_db)):
     return db.query(SecurityDB).all()
+
+class PriceUpdate(BaseModel):
+    latest_price: Decimal = Field(ge=0)
+
+
+@app.post("/securities/{symbol}/price")
+def update_price(symbol: str, price: PriceUpdate, db: Session = Depends(get_db)):
+    security = (
+        db.query(SecurityDB)
+        .filter(SecurityDB.symbol == symbol)
+        .first()
+    )
+    if security is None:
+        raise HTTPException(status_code=404, detail=f"Unknown symbol: {symbol}")
+
+    security.latest_price = price.latest_price
+    db.commit()
+    return {"message": "Price updated"}
+
+
+@app.get("/unrealized-gains")
+def get_unrealized_gains(db: Session = Depends(get_db)):
+    open_lots = (
+        db.query(TaxLotDB)
+        .filter(TaxLotDB.status == "open")
+        .all()
+    )
+
+    results = []
+    for lot in open_lots:
+        security = (
+            db.query(SecurityDB)
+            .filter(SecurityDB.symbol == lot.symbol)
+            .first()
+        )
+        if security is None or security.latest_price is None:
+            continue  # can't value a lot with no current price
+
+        market_value = lot.quantity_remaining * security.latest_price
+        cost_basis = lot.quantity_remaining * lot.cost_basis_per_unit
+        unrealized = market_value - cost_basis
+
+        results.append({
+            "lot_id": lot.id,
+            "symbol": lot.symbol,
+            "quantity_remaining": lot.quantity_remaining,
+            "cost_basis": cost_basis,
+            "market_value": market_value,
+            "unrealized_gain_loss": unrealized,
+        })
+
+    return results
