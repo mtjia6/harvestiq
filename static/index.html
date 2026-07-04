@@ -71,6 +71,12 @@
     </div>
   </div>
 
+  <!-- HOLDINGS -->
+  <div class="card">
+    <h2>Holdings</h2>
+    <div id="holdingsArea"><p class="muted">Loading…</p></div>
+  </div>
+
   <!-- HARVEST TABLE -->
   <div class="card">
     <h2>Harvest Opportunities</h2>
@@ -133,6 +139,26 @@ async function loadSummary() {
   document.getElementById('asOf').textContent = s.prices_as_of
     ? 'Prices as of ' + new Date(s.prices_as_of).toLocaleString()
     : 'Prices not yet refreshed';
+}
+
+async function loadPortfolio() {
+  const res = await fetch('/portfolio');
+  const data = await res.json();
+  const area = document.getElementById('holdingsArea');
+  if (!data.length) { area.innerHTML = '<p class="muted">No holdings yet.</p>'; return; }
+  const rows = data.map(h => `
+    <tr>
+      <td><strong>${h.symbol}</strong></td>
+      <td>${h.quantity}</td>
+      <td>${money(h.cost_basis)}</td>
+      <td>${money(h.market_value)}</td>
+      <td class="${cls(h.unrealized_gain_loss)}">${money(h.unrealized_gain_loss)}</td>
+    </tr>`).join('');
+  area.innerHTML = `
+    <table>
+      <thead><tr><th>Symbol</th><th>Quantity</th><th>Cost Basis</th><th>Market Value</th><th>Unrealized G/L</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
 }
 
 async function loadOpportunities() {
@@ -264,7 +290,7 @@ async function refreshPrices() {
   reloadAll();
 }
 
-function reloadAll() { loadSummary(); loadOpportunities(); loadRealized(); }
+function reloadAll() { loadSummary(); loadPortfolio(); loadOpportunities(); loadRealized(); }
 reloadAll();
 loadSecuritiesIntoSelect();
 </script>
