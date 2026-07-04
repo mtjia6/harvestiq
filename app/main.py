@@ -1,4 +1,4 @@
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from typing import Literal
@@ -6,7 +6,7 @@ from datetime import date
 from decimal import Decimal
 
 from app.database import get_db
-from app.model import TransactionDB
+from app.model import TransactionDB, SecurityDB
 
 app = FastAPI()
 
@@ -32,6 +32,17 @@ def create_transaction(
     transaction: Transaction,
     db: Session = Depends(get_db)
 ):
+    security = (
+        db.query(SecurityDB)
+        .filter(SecurityDB.symbol == transaction.symbol)
+        .first()
+    )
+    if security is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown symbol: {transaction.symbol}",
+        )
+
     db_transaction = TransactionDB(
         symbol=transaction.symbol,
         quantity=transaction.quantity,
@@ -83,3 +94,27 @@ def get_tax_lots(
     db: Session = Depends(get_db)
 ):
     return {"message": "not implemented yet"}
+
+class Security(BaseModel):
+    symbol: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    asset_class: Literal["equity", "crypto"]
+    currency: str = Field(min_length=1)
+
+
+@app.post("/securities")
+def create_security(security: Security, db: Session = Depends(get_db)):
+    db_security = SecurityDB(
+        symbol=security.symbol,
+        name=security.name,
+        asset_class=security.asset_class,
+        currency=security.currency,
+    )
+    db.add(db_security)
+    db.commit()
+    return {"message": "Security saved"}
+
+
+@app.get("/securities")
+def get_securities(db: Session = Depends(get_db)):
+    return db.query(SecurityDB).all()
