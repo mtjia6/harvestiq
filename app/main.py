@@ -1,6 +1,7 @@
 from fastapi import Depends, FastAPI
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import Literal
 from datetime import date
 from decimal import Decimal
 
@@ -11,14 +12,14 @@ app = FastAPI()
 
 
 class Transaction(BaseModel):
-    symbol: str
-    quantity: Decimal
-    price: Decimal
-    transaction_type: str
+    symbol: str = Field(min_length=1)
+    quantity: Decimal = Field(gt=0)
+    price: Decimal = Field(ge=0)
+    transaction_type: Literal["BUY", "SELL"]
     trade_date: date
-    broker: str
-    fees: Decimal
-    currency: str
+    broker: str = Field(min_length=1)
+    fees: Decimal = Field(ge=0)
+    currency: str = Field(min_length=1)
 
 
 @app.get("/")
