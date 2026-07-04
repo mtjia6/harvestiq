@@ -192,21 +192,33 @@ def get_transactions(db: Session = Depends(get_db)):
 
 @app.get("/portfolio")
 def get_portfolio(db: Session = Depends(get_db)):
-    transactions = db.query(TransactionDB).all()
+    open_lots = db.query(TaxLotDB).filter(TaxLotDB.status == "open").all()
 
     holdings = {}
+    for lot in open_lots:
+        h = holdings.setdefault(lot.symbol, {
+            "symbol": lot.symbol,
+            "quantity": Decimal("0"),
+            "cost_basis": Decimal("0"),
+        })
+        h["quantity"] += lot.quantity_remaining
+        h["cost_basis"] += lot.quantity_remaining * lot.cost_basis_per_unit
 
-    for transaction in transactions:
-
-        if transaction.symbol not in holdings:
-            holdings[transaction.symbol] = 0
-
-        if transaction.transaction_type == "BUY":
-            holdings[transaction.symbol] += transaction.quantity
+    result = []
+    for symbol, h in holdings.items():
+        security = (
+            db.query(SecurityDB)
+            .filter(SecurityDB.symbol == symbol)
+            .first()
+        )
+        if security and security.latest_price is not None:
+            h["market_value"] = h["quantity"] * security.latest_price
         else:
-            holdings[transaction.symbol] -= transaction.quantity
+            h["market_value"] = h["cost_basis"]
+        h["unrealized_gain_loss"] = h["market_value"] - h["cost_basis"]
+        result.append(h)
 
-    return holdings
+    return result
 
 
 @app.get("/tax-lots")
@@ -309,17 +321,25 @@ def get_wash_sales(db: Session = Depends(get_db)):
 
     results = []
     for loss in losses:
-        window_start = loss.sell_date - timedelta(days=30)
-        window_end = loss.sell_date + timedelta(days=30)
-
-        replacement = (
-            db.query(TransactionDB)
-            .filter(TransactionDB.symbol == loss.symbol)
-            .filter(TransactionDB.transaction_type == "BUY")
-            .filter(TransactionDB.trade_date >= window_start)
-            .filter(TransactionDB.trade_date <= window_end)
+        security = (
+            db.query(SecurityDB)
+            .filter(SecurityDB.symbol == loss.symbol)
             .first()
         )
+        is_crypto = security is not None and security.asset_class == "crypto"
+
+        replacement = None
+        if not is_crypto:
+            window_start = loss.sell_date - timedelta(days=30)
+            window_end = loss.sell_date + timedelta(days=30)
+            replacement = (
+                db.query(TransactionDB)
+                .filter(TransactionDB.symbol == loss.symbol)
+                .filter(TransactionDB.transaction_type == "BUY")
+                .filter(TransactionDB.trade_date >= window_start)
+                .filter(TransactionDB.trade_date <= window_end)
+                .first()
+            )
 
         results.append({
             "realized_gain_id": loss.id,
@@ -369,23 +389,29 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
 
         estimated_tax_savings = -unrealized * tax_rate
 
-        window_start = today - timedelta(days=30)
-        recent_buy = (
-            db.query(TransactionDB)
-            .filter(TransactionDB.symbol == lot.symbol)
-            .filter(TransactionDB.transaction_type == "BUY")
-            .filter(TransactionDB.trade_date >= window_start)
-            .first()
-        )
-        wash_sale_risk = recent_buy is not None
-        wash_sale_reason = (
-            f"you bought {lot.symbol} on {recent_buy.trade_date}, within the last 30 days"
-            if recent_buy else None
-        )
+        # Wash-sale rule applies to securities, not crypto (treated as property).
+        if security.asset_class == "crypto":
+            wash_sale_risk = False
+            wash_sale_reason = None
+        else:
+            window_start = today - timedelta(days=30)
+            recent_buy = (
+                db.query(TransactionDB)
+                .filter(TransactionDB.symbol == lot.symbol)
+                .filter(TransactionDB.transaction_type == "BUY")
+                .filter(TransactionDB.trade_date >= window_start)
+                .first()
+            )
+            wash_sale_risk = recent_buy is not None
+            wash_sale_reason = (
+                f"you bought {lot.symbol} on {recent_buy.trade_date}, within the last 30 days"
+                if recent_buy else None
+            )
 
         opportunities.append({
             "lot_id": lot.id,
             "symbol": lot.symbol,
+            "asset_class": security.asset_class,
             "quantity_remaining": lot.quantity_remaining,
             "cost_basis": cost_basis,
             "market_value": market_value,
