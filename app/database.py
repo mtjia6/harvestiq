@@ -7,7 +7,6 @@ DATABASE_URL = "postgresql://localhost/harvestiq"
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 
-Base.metadata.create_all(engine)
 
 def get_db():
     db = SessionLocal()
