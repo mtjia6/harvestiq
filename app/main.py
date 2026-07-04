@@ -2,7 +2,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from typing import Literal
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 from app.database import get_db
@@ -244,6 +244,39 @@ def get_unrealized_gains(db: Session = Depends(get_db)):
             "cost_basis": cost_basis,
             "market_value": market_value,
             "unrealized_gain_loss": unrealized,
+        })
+
+    return results
+
+@app.get("/wash-sales")
+def get_wash_sales(db: Session = Depends(get_db)):
+    losses = (
+        db.query(RealizedGainDB)
+        .filter(RealizedGainDB.gain_loss < 0)
+        .all()
+    )
+
+    results = []
+    for loss in losses:
+        window_start = loss.sell_date - timedelta(days=30)
+        window_end = loss.sell_date + timedelta(days=30)
+
+        replacement = (
+            db.query(TransactionDB)
+            .filter(TransactionDB.symbol == loss.symbol)
+            .filter(TransactionDB.transaction_type == "BUY")
+            .filter(TransactionDB.trade_date >= window_start)
+            .filter(TransactionDB.trade_date <= window_end)
+            .first()
+        )
+
+        results.append({
+            "realized_gain_id": loss.id,
+            "symbol": loss.symbol,
+            "sell_date": loss.sell_date,
+            "loss_amount": loss.gain_loss,
+            "wash_sale": replacement is not None,
+            "triggering_buy_id": replacement.id if replacement else None,
         })
 
     return results
