@@ -1,6 +1,8 @@
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy import Integer, String, Float
+from sqlalchemy import Integer, String, Numeric, Date
+import datetime
+import decimal
 
 
 class Base(DeclarativeBase):
@@ -11,19 +13,11 @@ class TransactionDB(Base):
     __tablename__ = "transactions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-
     symbol: Mapped[str] = mapped_column(String)
-
-    quantity: Mapped[int] = mapped_column(Integer)
-
-    price: Mapped[float] = mapped_column(Float)
-
+    quantity: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
+    price: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
     transaction_type: Mapped[str] = mapped_column(String)
-
-    trade_date: Mapped[str] = mapped_column(String)
-
+    trade_date: Mapped[datetime.date] = mapped_column(Date)
     broker: Mapped[str] = mapped_column(String)
-
-    fees: Mapped[float] = mapped_column(Float)
-
+    fees: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
     currency: Mapped[str] = mapped_column(String)

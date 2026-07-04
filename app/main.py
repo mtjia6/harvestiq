@@ -1,6 +1,8 @@
 from fastapi import Depends, FastAPI
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
+from datetime import date
+from decimal import Decimal
 
 from app.database import get_db
 from app.model import TransactionDB
@@ -10,12 +12,12 @@ app = FastAPI()
 
 class Transaction(BaseModel):
     symbol: str
-    quantity: int
-    price: float
+    quantity: Decimal
+    price: Decimal
     transaction_type: str
-    trade_date: str
+    trade_date: date
     broker: str
-    fees: float
+    fees: Decimal
     currency: str
 
 
@@ -79,3 +81,4 @@ def get_portfolio(
 def get_tax_lots(
     db: Session = Depends(get_db)
 ):
+    return {"message": "not implemented yet"}
