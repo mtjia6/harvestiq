@@ -32,6 +32,7 @@ class SecurityDB(Base):
     asset_class: Mapped[str] = mapped_column(String)
     currency: Mapped[str] = mapped_column(String)
     latest_price: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(20, 8), nullable=True)
+    sector: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
 class TaxLotDB(Base):
     __tablename__ = "tax_lots"

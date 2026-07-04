@@ -221,6 +221,7 @@ class Security(BaseModel):
     name: str = Field(min_length=1)
     asset_class: Literal["equity", "crypto"]
     currency: str = Field(min_length=1)
+    sector: str = Field(min_length=1)
 
 
 @app.post("/securities")
@@ -230,6 +231,7 @@ def create_security(security: Security, db: Session = Depends(get_db)):
         name=security.name,
         asset_class=security.asset_class,
         currency=security.currency,
+        sector=security.sector,
     )
     db.add(db_security)
     db.commit()
@@ -461,3 +463,34 @@ def refresh_prices(db: Session = Depends(get_db)):
 
     db.commit()
     return {"updated": updated}
+
+@app.get("/replacement-suggestions")
+def get_replacement_suggestions(db: Session = Depends(get_db)):
+    opportunities = build_harvest_opportunities(db, SHORT_TERM_TAX_RATE, LONG_TERM_TAX_RATE)
+
+    suggestions = []
+    for o in opportunities:
+        security = (
+            db.query(SecurityDB)
+            .filter(SecurityDB.symbol == o["symbol"])
+            .first()
+        )
+
+        if security is None or security.sector is None:
+            replacements = []
+        else:
+            alternatives = (
+                db.query(SecurityDB)
+                .filter(SecurityDB.sector == security.sector)
+                .filter(SecurityDB.symbol != security.symbol)
+                .all()
+            )
+            replacements = [a.symbol for a in alternatives]
+
+        suggestions.append({
+            "sell_symbol": o["symbol"],
+            "estimated_tax_savings": o["estimated_tax_savings"],
+            "replacements": replacements,
+        })
+
+    return suggestions
