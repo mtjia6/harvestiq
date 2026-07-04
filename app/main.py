@@ -30,16 +30,21 @@ class Transaction(BaseModel):
     currency: str = Field(min_length=1)
 
 
+class MarketTransaction(BaseModel):
+    symbol: str = Field(min_length=1)
+    quantity: Decimal = Field(gt=0)
+    transaction_type: Literal["BUY", "SELL"]
+    broker: str = Field(min_length=1)
+    fees: Decimal = Field(ge=0)
+    currency: str = Field(min_length=1)
+
+
 @app.get("/")
 def home():
     return {"message": "HarvestIQ running"}
 
 
-@app.post("/transactions")
-def create_transaction(
-    transaction: Transaction,
-    db: Session = Depends(get_db)
-):
+def process_transaction(transaction: Transaction, db: Session):
     security = (
         db.query(SecurityDB)
         .filter(SecurityDB.symbol == transaction.symbol)
@@ -143,18 +148,47 @@ def create_transaction(
 
     return {"message": "Transaction saved"}
 
+
+@app.post("/transactions")
+def create_transaction(transaction: Transaction, db: Session = Depends(get_db)):
+    return process_transaction(transaction, db)
+
+
+@app.post("/transactions/market")
+def create_market_transaction(market: MarketTransaction, db: Session = Depends(get_db)):
+    ticker = yf.Ticker(market.symbol)
+    data = ticker.history(period="1d")
+
+    if data.empty:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not fetch a market price for {market.symbol}",
+        )
+
+    current_price = Decimal(str(round(float(data["Close"].iloc[-1]), 2)))
+
+    transaction = Transaction(
+        symbol=market.symbol,
+        quantity=market.quantity,
+        price=current_price,
+        transaction_type=market.transaction_type,
+        trade_date=date.today(),
+        broker=market.broker,
+        fees=market.fees,
+        currency=market.currency,
+    )
+
+    return process_transaction(transaction, db)
+
+
 @app.get("/transactions")
-def get_transactions(
-    db: Session = Depends(get_db)
-):
+def get_transactions(db: Session = Depends(get_db)):
     transactions = db.query(TransactionDB).all()
     return transactions
 
 
 @app.get("/portfolio")
-def get_portfolio(
-    db: Session = Depends(get_db)
-):
+def get_portfolio(db: Session = Depends(get_db)):
     transactions = db.query(TransactionDB).all()
 
     holdings = {}
@@ -176,9 +210,11 @@ def get_portfolio(
 def get_tax_lots(db: Session = Depends(get_db)):
     return db.query(TaxLotDB).all()
 
+
 @app.get("/realized-gains")
 def get_realized_gains(db: Session = Depends(get_db)):
     return db.query(RealizedGainDB).all()
+
 
 class Security(BaseModel):
     symbol: str = Field(min_length=1)
@@ -203,6 +239,7 @@ def create_security(security: Security, db: Session = Depends(get_db)):
 @app.get("/securities")
 def get_securities(db: Session = Depends(get_db)):
     return db.query(SecurityDB).all()
+
 
 class PriceUpdate(BaseModel):
     latest_price: Decimal = Field(ge=0)
@@ -256,6 +293,7 @@ def get_unrealized_gains(db: Session = Depends(get_db)):
 
     return results
 
+
 @app.get("/wash-sales")
 def get_wash_sales(db: Session = Depends(get_db)):
     losses = (
@@ -288,6 +326,7 @@ def get_wash_sales(db: Session = Depends(get_db)):
         })
 
     return results
+
 
 def build_harvest_opportunities(db, short_term_rate, long_term_rate):
     open_lots = (
@@ -360,6 +399,7 @@ def get_harvest_opportunities(
 ):
     return build_harvest_opportunities(db, short_term_rate, long_term_rate)
 
+
 @app.get("/harvest-explanation")
 def get_harvest_explanation(
     short_term_rate: Decimal = SHORT_TERM_TAX_RATE,
@@ -398,6 +438,7 @@ def get_harvest_explanation(
     )
 
     return {"explanation": response.choices[0].message.content}
+
 
 @app.post("/refresh-prices")
 def refresh_prices(db: Session = Depends(get_db)):
