@@ -2,10 +2,11 @@ from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from typing import Literal
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 from decimal import Decimal
 from groq import Groq
 import yfinance as yf
+from fastapi.responses import FileResponse
 
 from app.database import get_db
 from app.model import TransactionDB, SecurityDB, TaxLotDB, RealizedGainDB
@@ -17,6 +18,7 @@ app = FastAPI()
 
 SHORT_TERM_TAX_RATE = Decimal("0.40")  # default: ~35% federal + ~5% GA
 LONG_TERM_TAX_RATE = Decimal("0.20")   # default: ~15% federal + ~5% GA
+LAST_PRICE_REFRESH = None
 
 
 class Transaction(BaseModel):
@@ -44,6 +46,11 @@ def home():
     return {"message": "HarvestIQ running"}
 
 
+@app.get("/dashboard")
+def dashboard():
+    return FileResponse("static/index.html")
+
+
 def process_transaction(transaction: Transaction, db: Session):
     security = (
         db.query(SecurityDB)
@@ -56,8 +63,6 @@ def process_transaction(transaction: Transaction, db: Session):
             detail=f"Unknown symbol: {transaction.symbol}",
         )
 
-    # For a SELL, gather open lots oldest-first and confirm we own enough
-    # BEFORE saving anything.
     open_lots = []
     if transaction.transaction_type == "SELL":
         open_lots = (
@@ -113,12 +118,10 @@ def process_transaction(transaction: Transaction, db: Session):
                 break
 
             if lot.quantity_remaining <= quantity_to_sell:
-                # sell this entire lot
                 quantity_sold = lot.quantity_remaining
                 lot.quantity_remaining = 0
                 lot.status = "closed"
             else:
-                # sell part of this lot
                 quantity_sold = quantity_to_sell
                 lot.quantity_remaining -= quantity_to_sell
 
@@ -278,7 +281,7 @@ def get_unrealized_gains(db: Session = Depends(get_db)):
             .first()
         )
         if security is None or security.latest_price is None:
-            continue  # can't value a lot with no current price
+            continue
 
         market_value = lot.quantity_remaining * security.latest_price
         cost_basis = lot.quantity_remaining * lot.cost_basis_per_unit
@@ -375,6 +378,10 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
             .first()
         )
         wash_sale_risk = recent_buy is not None
+        wash_sale_reason = (
+            f"you bought {lot.symbol} on {recent_buy.trade_date}, within the last 30 days"
+            if recent_buy else None
+        )
 
         opportunities.append({
             "lot_id": lot.id,
@@ -386,6 +393,7 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
             "term": term,
             "estimated_tax_savings": estimated_tax_savings,
             "wash_sale_risk": wash_sale_risk,
+            "wash_sale_reason": wash_sale_reason,
             "recommended": not wash_sale_risk,
         })
 
@@ -413,23 +421,42 @@ def get_harvest_explanation(
     if not opportunities:
         return {"explanation": "No harvesting opportunities right now — none of your open lots are at a loss."}
 
+    def replacements_for(symbol):
+        sec = db.query(SecurityDB).filter(SecurityDB.symbol == symbol).first()
+        if sec is None or sec.sector is None:
+            return []
+        alts = (
+            db.query(SecurityDB)
+            .filter(SecurityDB.sector == sec.sector)
+            .filter(SecurityDB.symbol != symbol)
+            .all()
+        )
+        return [a.symbol for a in alts]
+
     lines = []
     for o in opportunities:
+        reps = replacements_for(o["symbol"])
+        if o["recommended"]:
+            status = "recommended (no wash-sale risk)"
+        else:
+            status = f"WASH-SALE RISK: {o.get('wash_sale_reason') or 'a purchase within the last 30 days'}"
+        rep_txt = f"; possible replacements: {', '.join(reps)}" if reps else ""
         lines.append(
-            f"- {o['symbol']}: {o['quantity_remaining']} units, "
-            f"unrealized loss {o['unrealized_loss']}, {o['term']}-term, "
-            f"estimated tax savings {o['estimated_tax_savings']}, "
-            f"wash-sale risk: {o['wash_sale_risk']}"
+            f"- {o['symbol']}: {o['quantity_remaining']} units, unrealized loss {o['unrealized_loss']}, "
+            f"{o['term']}-term, estimated tax savings {o['estimated_tax_savings']}, {status}{rep_txt}"
         )
     summary = "\n".join(lines)
 
     prompt = (
-        "You are explaining tax-loss harvesting to a beginner investor. "
-        "Here are the current harvest opportunities in their portfolio:\n\n"
+        "You are a concise financial assistant explaining tax-loss harvesting to a beginner. "
+        "Here are the harvest opportunities in the portfolio:\n\n"
         f"{summary}\n\n"
-        "In plain English, explain which positions they might consider selling and why, "
-        "referencing the estimated tax savings and any wash-sale risks. Be concise. "
-        "End with a one-line reminder that this is not personalized tax advice."
+        "For each position, state the estimated tax saving and whether to act now. "
+        "If a position is a WASH-SALE RISK, explain the specific stated reason and that selling now would "
+        "DISALLOW the loss, so they should wait until the 30-day window passes or harvest a different position; "
+        "recommend the listed replacement tickers if provided. "
+        "Do NOT use vague phrasing like 'or will buy one within 30 days' — use the actual reason given. "
+        "Be specific and concise. End with exactly one line: 'This is not personalized tax advice.'"
     )
 
     client = Groq()
@@ -444,6 +471,7 @@ def get_harvest_explanation(
 
 @app.post("/refresh-prices")
 def refresh_prices(db: Session = Depends(get_db)):
+    global LAST_PRICE_REFRESH
     securities = db.query(SecurityDB).all()
 
     updated = []
@@ -452,7 +480,7 @@ def refresh_prices(db: Session = Depends(get_db)):
         data = ticker.history(period="1d")
 
         if data.empty:
-            continue  # no data returned for this symbol, skip it
+            continue
 
         latest_close = float(data["Close"].iloc[-1])
         security.latest_price = Decimal(str(round(latest_close, 2)))
@@ -462,7 +490,85 @@ def refresh_prices(db: Session = Depends(get_db)):
         })
 
     db.commit()
+    LAST_PRICE_REFRESH = datetime.now(timezone.utc).isoformat()
     return {"updated": updated}
+
+
+@app.get("/price-history/{symbol}")
+def get_price_history(symbol: str, days: int = 90):
+    ticker = yf.Ticker(symbol)
+    end = datetime.now()
+    start = end - timedelta(days=days)
+    data = ticker.history(
+        start=start.strftime("%Y-%m-%d"),
+        end=end.strftime("%Y-%m-%d"),
+    )
+    if data.empty:
+        raise HTTPException(status_code=404, detail=f"No price history for {symbol}")
+
+    history = [
+        {"date": idx.strftime("%Y-%m-%d"), "close": round(float(row["Close"]), 2)}
+        for idx, row in data.iterrows()
+    ]
+    return {"symbol": symbol, "history": history}
+
+
+@app.get("/portfolio-summary")
+def get_portfolio_summary(
+    short_term_rate: Decimal = SHORT_TERM_TAX_RATE,
+    long_term_rate: Decimal = LONG_TERM_TAX_RATE,
+    db: Session = Depends(get_db),
+):
+    open_lots = db.query(TaxLotDB).filter(TaxLotDB.status == "open").all()
+
+    total_market_value = Decimal("0")
+    total_cost_basis = Decimal("0")
+    for lot in open_lots:
+        security = (
+            db.query(SecurityDB)
+            .filter(SecurityDB.symbol == lot.symbol)
+            .first()
+        )
+        cost = lot.quantity_remaining * lot.cost_basis_per_unit
+        total_cost_basis += cost
+        if security and security.latest_price is not None:
+            total_market_value += lot.quantity_remaining * security.latest_price
+        else:
+            total_market_value += cost  # no price yet: value at cost
+
+    total_unrealized = total_market_value - total_cost_basis
+
+    today = date.today()
+    year_start = date(today.year, 1, 1)
+    realized = (
+        db.query(RealizedGainDB)
+        .filter(RealizedGainDB.sell_date >= year_start)
+        .all()
+    )
+    realized_short = sum((r.gain_loss for r in realized if r.term == "short"), Decimal("0"))
+    realized_long = sum((r.gain_loss for r in realized if r.term == "long"), Decimal("0"))
+    realized_total = realized_short + realized_long
+
+    opps = build_harvest_opportunities(db, short_term_rate, long_term_rate)
+    rec = [o for o in opps if o["recommended"]]
+    harvestable_savings = sum((o["estimated_tax_savings"] for o in rec), Decimal("0"))
+    harvestable_loss = sum((-o["unrealized_loss"] for o in rec), Decimal("0"))
+
+    useful_loss_budget = max(realized_total, Decimal("0")) + Decimal("3000")
+
+    return {
+        "total_market_value": total_market_value,
+        "total_cost_basis": total_cost_basis,
+        "total_unrealized_gain_loss": total_unrealized,
+        "realized_ytd_short": realized_short,
+        "realized_ytd_long": realized_long,
+        "realized_ytd_total": realized_total,
+        "harvestable_recommended_loss": harvestable_loss,
+        "harvestable_recommended_savings": harvestable_savings,
+        "useful_loss_budget": useful_loss_budget,
+        "prices_as_of": LAST_PRICE_REFRESH,
+    }
+
 
 @app.get("/replacement-suggestions")
 def get_replacement_suggestions(db: Session = Depends(get_db)):

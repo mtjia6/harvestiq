@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HarvestIQ</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --card2:#172033; --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --green:#4ade80; --red:#f87171; --border:#334155; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:20px 32px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; }
+  h1 { margin:0; font-size:22px; }
+  .sub { color:var(--muted); font-size:13px; margin-top:4px; }
+  main { padding:24px 32px; max-width:1100px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px; margin-bottom:24px; }
+  h2 { margin:0 0 12px; font-size:16px; }
+  .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:16px; }
+  .stat { background:var(--card2); border:1px solid var(--border); border-radius:10px; padding:16px; }
+  .stat .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  .stat .value { font-size:24px; font-weight:700; margin-top:6px; }
+  .controls { display:flex; gap:16px; align-items:flex-end; flex-wrap:wrap; }
+  label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
+  input, select { background:var(--bg); border:1px solid var(--border); color:var(--text); border-radius:8px; padding:8px 10px; }
+  input { width:120px; }
+  button { background:var(--accent); color:#04263a; border:none; border-radius:8px; padding:9px 16px; font-weight:600; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  table { width:100%; border-collapse:collapse; margin-top:8px; }
+  th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); font-size:14px; }
+  th { color:var(--muted); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  .green { color:var(--green); } .red { color:var(--red); }
+  .badge { font-size:11px; padding:2px 8px; border-radius:99px; }
+  .badge.ok { background:rgba(74,222,128,.15); color:var(--green); }
+  .badge.warn { background:rgba(248,113,113,.15); color:var(--red); }
+  .tally { margin-top:12px; font-size:14px; color:var(--muted); }
+  .tally strong { color:var(--green); }
+  .explanation { white-space:pre-wrap; line-height:1.5; font-size:14px; margin-top:12px; }
+  .muted { color:var(--muted); }
+  .disclaimer { font-size:12px; color:var(--muted); margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>HarvestIQ</h1>
+    <div class="sub">Tax-loss harvesting dashboard</div>
+  </div>
+  <div style="text-align:right;">
+    <button class="secondary" onclick="refreshPrices()">Refresh Prices</button>
+    <div id="asOf" class="sub" style="margin-top:6px;">Prices not yet refreshed</div>
+  </div>
+</header>
+
+<main>
+  <!-- OVERVIEW -->
+  <div class="grid" id="overview">
+    <div class="stat"><div class="label">Portfolio Value</div><div class="value" id="s_value">—</div></div>
+    <div class="stat"><div class="label">Unrealized G/L</div><div class="value" id="s_unrealized">—</div></div>
+    <div class="stat"><div class="label">Realized G/L (YTD)</div><div class="value" id="s_realized">—</div></div>
+    <div class="stat"><div class="label">Recommended Tax Savings</div><div class="value green" id="s_savings">—</div></div>
+  </div>
+  <div class="disclaimer" id="budgetLine"></div>
+
+  <!-- CONTROLS -->
+  <div class="card" style="margin-top:24px;">
+    <div class="controls">
+      <div><label>Short-term rate</label><input id="shortRate" type="number" step="0.01" value="0.15"></div>
+      <div><label>Long-term rate</label><input id="longRate" type="number" step="0.01" value="0.05"></div>
+      <div><label>Min. savings ($)</label><input id="minSavings" type="number" step="1" value="0"></div>
+      <button onclick="reloadAll()">Update</button>
+    </div>
+  </div>
+
+  <!-- HARVEST TABLE -->
+  <div class="card">
+    <h2>Harvest Opportunities</h2>
+    <div id="oppArea"><p class="muted">Loading…</p></div>
+    <div class="tally" id="tally"></div>
+  </div>
+
+  <!-- PRICE CHART -->
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <h2>Price History (90 days)</h2>
+      <select id="chartSymbol" onchange="loadChart()"></select>
+    </div>
+    <canvas id="priceChart" height="90"></canvas>
+  </div>
+
+  <!-- AI -->
+  <div class="card">
+    <h2>AI Explanation</h2>
+    <button class="secondary" onclick="loadExplanation()">Explain My Options</button>
+    <div id="explanation" class="explanation muted">No explanation yet.</div>
+  </div>
+
+  <!-- REALIZED LOG -->
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <h2>Realized Gains Log</h2>
+      <button class="secondary" onclick="exportCSV()">Export CSV</button>
+    </div>
+    <div id="realizedArea"><p class="muted">Loading…</p></div>
+  </div>
+
+  <div class="disclaimer">General information only — not personalized tax advice. Harvesting defers tax by lowering cost basis; benefit depends on your bracket.</div>
+</main>
+
+<script>
+let realizedCache = [];
+let priceChart = null;
+
+function rates() {
+  return `short_term_rate=${document.getElementById('shortRate').value}&long_term_rate=${document.getElementById('longRate').value}`;
+}
+function money(n) {
+  const v = Number(n);
+  return (v < 0 ? '-$' : '$') + Math.abs(v).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+}
+function cls(n) { return Number(n) < 0 ? 'red' : 'green'; }
+
+async function loadSummary() {
+  const res = await fetch(`/portfolio-summary?${rates()}`);
+  const s = await res.json();
+  document.getElementById('s_value').textContent = money(s.total_market_value);
+  const u = document.getElementById('s_unrealized');
+  u.textContent = money(s.total_unrealized_gain_loss); u.className = 'value ' + cls(s.total_unrealized_gain_loss);
+  const r = document.getElementById('s_realized');
+  r.textContent = money(s.realized_ytd_total); r.className = 'value ' + cls(s.realized_ytd_total);
+  document.getElementById('s_savings').textContent = money(s.harvestable_recommended_savings);
+  document.getElementById('budgetLine').textContent =
+    `Useful loss budget this year ≈ ${money(s.useful_loss_budget)} (realized gains + $3,000 ordinary income offset).`;
+  document.getElementById('asOf').textContent = s.prices_as_of
+    ? 'Prices as of ' + new Date(s.prices_as_of).toLocaleString()
+    : 'Prices not yet refreshed';
+}
+
+async function loadOpportunities() {
+  const area = document.getElementById('oppArea');
+  const [oppRes, repRes] = await Promise.all([
+    fetch(`/harvest-opportunities?${rates()}`),
+    fetch(`/replacement-suggestions`)
+  ]);
+  let opps = await oppRes.json();
+  const reps = await repRes.json();
+  const repMap = {};
+  reps.forEach(r => repMap[r.sell_symbol] = r.replacements);
+
+  const minSave = Number(document.getElementById('minSavings').value) || 0;
+  opps = opps.filter(o => Number(o.estimated_tax_savings) >= minSave);
+
+  if (opps.length === 0) {
+    area.innerHTML = '<p class="muted">No opportunities match — nothing at a loss above your threshold.</p>';
+    document.getElementById('tally').textContent = '';
+    return;
+  }
+
+  const rows = opps.map(o => `
+    <tr>
+      <td><strong>${o.symbol}</strong></td>
+      <td>${o.quantity_remaining}</td>
+      <td class="red">${money(o.unrealized_loss)}</td>
+      <td>${o.term}</td>
+      <td class="green">${money(o.estimated_tax_savings)}</td>
+      <td>${(repMap[o.symbol] && repMap[o.symbol].length) ? repMap[o.symbol].join(', ') : '—'}</td>
+      <td>${o.recommended ? '<span class="badge ok">Recommended</span>' : '<span class="badge warn">Wash-sale risk</span>'}</td>
+    </tr>`).join('');
+
+  area.innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Symbol</th><th>Qty</th><th>Unrealized Loss</th><th>Term</th>
+        <th>Est. Tax Savings</th><th>Buy Instead</th><th>Status</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+
+  const totalLoss = opps.reduce((a,o)=>a+Number(o.unrealized_loss),0);
+  const totalSave = opps.filter(o=>o.recommended).reduce((a,o)=>a+Number(o.estimated_tax_savings),0);
+  document.getElementById('tally').innerHTML =
+    `If you harvest all shown: total loss booked ${money(totalLoss)} · estimated tax saved <strong>${money(totalSave)}</strong>`;
+}
+
+async function loadSecuritiesIntoSelect() {
+  const res = await fetch('/securities');
+  const secs = await res.json();
+  const sel = document.getElementById('chartSymbol');
+  sel.innerHTML = secs.map(s => `<option value="${s.symbol}">${s.symbol}</option>`).join('');
+  if (secs.length) loadChart();
+}
+
+async function loadChart() {
+  const sym = document.getElementById('chartSymbol').value;
+  if (!sym) return;
+  const res = await fetch(`/price-history/${sym}?days=90`);
+  if (!res.ok) return;
+  const data = await res.json();
+  const labels = data.history.map(h => h.date);
+  const prices = data.history.map(h => h.close);
+  if (priceChart) priceChart.destroy();
+  const ctx = document.getElementById('priceChart').getContext('2d');
+  priceChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets: [{
+      label: sym + ' close', data: prices,
+      borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,.1)',
+      fill: true, tension: .2, pointRadius: 0
+    }]},
+    options: {
+      plugins: { legend: { labels: { color: '#e2e8f0' } } },
+      scales: {
+        x: { ticks: { color: '#94a3b8', maxTicksLimit: 6 }, grid: { color: '#334155' } },
+        y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }
+      }
+    }
+  });
+}
+
+async function loadRealized() {
+  const res = await fetch('/realized-gains');
+  realizedCache = await res.json();
+  const area = document.getElementById('realizedArea');
+  if (realizedCache.length === 0) { area.innerHTML = '<p class="muted">No realized gains yet.</p>'; return; }
+  const rows = realizedCache.map(r => `
+    <tr>
+      <td>${r.sell_date}</td>
+      <td><strong>${r.symbol}</strong></td>
+      <td>${r.quantity_sold}</td>
+      <td>${money(r.proceeds)}</td>
+      <td>${money(r.cost_basis)}</td>
+      <td class="${cls(r.gain_loss)}">${money(r.gain_loss)}</td>
+      <td>${r.term}</td>
+    </tr>`).join('');
+  area.innerHTML = `
+    <table>
+      <thead><tr><th>Date</th><th>Symbol</th><th>Qty</th><th>Proceeds</th><th>Cost Basis</th><th>Gain/Loss</th><th>Term</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function exportCSV() {
+  if (!realizedCache.length) { alert('No realized gains to export.'); return; }
+  const header = ['sell_date','symbol','quantity_sold','proceeds','cost_basis','gain_loss','term'];
+  const lines = [header.join(',')];
+  realizedCache.forEach(r => lines.push(header.map(h => r[h]).join(',')));
+  const blob = new Blob([lines.join('\n')], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'realized_gains.csv';
+  a.click();
+}
+
+async function loadExplanation() {
+  const box = document.getElementById('explanation');
+  box.classList.remove('muted'); box.textContent = 'Thinking…';
+  const res = await fetch(`/harvest-explanation?${rates()}`);
+  const data = await res.json();
+  box.textContent = data.explanation;
+}
+
+async function refreshPrices() {
+  document.getElementById('asOf').textContent = 'Fetching live prices…';
+  await fetch('/refresh-prices', { method:'POST' });
+  reloadAll();
+}
+
+function reloadAll() { loadSummary(); loadOpportunities(); loadRealized(); }
+reloadAll();
+loadSecuritiesIntoSelect();
+</script>
+</body>
+</html>
