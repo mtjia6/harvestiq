@@ -9,6 +9,9 @@ from groq import Groq
 from app.database import get_db
 from app.model import TransactionDB, SecurityDB, TaxLotDB, RealizedGainDB
 
+from dotenv import load_dotenv
+load_dotenv()
+
 app = FastAPI()
 
 SHORT_TERM_TAX_RATE = Decimal("0.40")  # default: ~35% federal + ~5% GA
