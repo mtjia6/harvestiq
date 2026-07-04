@@ -43,6 +43,24 @@ def create_transaction(
             detail=f"Unknown symbol: {transaction.symbol}",
         )
 
+    # For a SELL, gather open lots oldest-first and confirm we own enough
+    # BEFORE saving anything.
+    open_lots = []
+    if transaction.transaction_type == "SELL":
+        open_lots = (
+            db.query(TaxLotDB)
+            .filter(TaxLotDB.symbol == transaction.symbol)
+            .filter(TaxLotDB.status == "open")
+            .order_by(TaxLotDB.opened_date)
+            .all()
+        )
+        total_available = sum(lot.quantity_remaining for lot in open_lots)
+        if total_available < transaction.quantity:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not enough {transaction.symbol} to sell: have {total_available}, tried {transaction.quantity}",
+            )
+
     db_transaction = TransactionDB(
         symbol=transaction.symbol,
         quantity=transaction.quantity,
@@ -74,8 +92,26 @@ def create_transaction(
         db.add(lot)
         db.commit()
 
-    return {"message": "Transaction saved"}
+    if transaction.transaction_type == "SELL":
+        quantity_to_sell = transaction.quantity
 
+        for lot in open_lots:
+            if quantity_to_sell <= 0:
+                break
+
+            if lot.quantity_remaining <= quantity_to_sell:
+                # sell this entire lot
+                quantity_to_sell -= lot.quantity_remaining
+                lot.quantity_remaining = 0
+                lot.status = "closed"
+            else:
+                # sell part of this lot
+                lot.quantity_remaining -= quantity_to_sell
+                quantity_to_sell = 0
+
+        db.commit()
+
+    return {"message": "Transaction saved"}
 
 @app.get("/transactions")
 def get_transactions(
