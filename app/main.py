@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from typing import Literal
 from datetime import date, timedelta
 from decimal import Decimal
+from groq import Groq
 
 from app.database import get_db
 from app.model import TransactionDB, SecurityDB, TaxLotDB, RealizedGainDB
@@ -284,12 +285,7 @@ def get_wash_sales(db: Session = Depends(get_db)):
 
     return results
 
-@app.get("/harvest-opportunities")
-def get_harvest_opportunities(
-    short_term_rate: Decimal = SHORT_TERM_TAX_RATE,
-    long_term_rate: Decimal = LONG_TERM_TAX_RATE,
-    db: Session = Depends(get_db),
-):
+def build_harvest_opportunities(db, short_term_rate, long_term_rate):
     open_lots = (
         db.query(TaxLotDB)
         .filter(TaxLotDB.status == "open")
@@ -312,7 +308,6 @@ def get_harvest_opportunities(
         cost_basis = lot.quantity_remaining * lot.cost_basis_per_unit
         unrealized = market_value - cost_basis
 
-        # only losses can be harvested
         if unrealized >= 0:
             continue
 
@@ -324,10 +319,8 @@ def get_harvest_opportunities(
             term = "short"
             tax_rate = short_term_rate
 
-        # unrealized is negative, so -unrealized is the size of the loss
         estimated_tax_savings = -unrealized * tax_rate
 
-        # would selling today be a wash sale? check for a buy in the last 30 days
         window_start = today - timedelta(days=30)
         recent_buy = (
             db.query(TransactionDB)
@@ -351,7 +344,53 @@ def get_harvest_opportunities(
             "recommended": not wash_sale_risk,
         })
 
-    # best opportunities first
     opportunities.sort(key=lambda o: o["estimated_tax_savings"], reverse=True)
-
     return opportunities
+
+
+@app.get("/harvest-opportunities")
+def get_harvest_opportunities(
+    short_term_rate: Decimal = SHORT_TERM_TAX_RATE,
+    long_term_rate: Decimal = LONG_TERM_TAX_RATE,
+    db: Session = Depends(get_db),
+):
+    return build_harvest_opportunities(db, short_term_rate, long_term_rate)
+
+@app.get("/harvest-explanation")
+def get_harvest_explanation(
+    short_term_rate: Decimal = SHORT_TERM_TAX_RATE,
+    long_term_rate: Decimal = LONG_TERM_TAX_RATE,
+    db: Session = Depends(get_db),
+):
+    opportunities = build_harvest_opportunities(db, short_term_rate, long_term_rate)
+
+    if not opportunities:
+        return {"explanation": "No harvesting opportunities right now — none of your open lots are at a loss."}
+
+    lines = []
+    for o in opportunities:
+        lines.append(
+            f"- {o['symbol']}: {o['quantity_remaining']} units, "
+            f"unrealized loss {o['unrealized_loss']}, {o['term']}-term, "
+            f"estimated tax savings {o['estimated_tax_savings']}, "
+            f"wash-sale risk: {o['wash_sale_risk']}"
+        )
+    summary = "\n".join(lines)
+
+    prompt = (
+        "You are explaining tax-loss harvesting to a beginner investor. "
+        "Here are the current harvest opportunities in their portfolio:\n\n"
+        f"{summary}\n\n"
+        "In plain English, explain which positions they might consider selling and why, "
+        "referencing the estimated tax savings and any wash-sale risks. Be concise. "
+        "End with a one-line reminder that this is not personalized tax advice."
+    )
+
+    client = Groq()
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-20b",
+        max_tokens=800,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    return {"explanation": response.choices[0].message.content}
