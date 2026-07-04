@@ -5,6 +5,7 @@ from typing import Literal
 from datetime import date, timedelta
 from decimal import Decimal
 from groq import Groq
+import yfinance as yf
 
 from app.database import get_db
 from app.model import TransactionDB, SecurityDB, TaxLotDB, RealizedGainDB
@@ -397,3 +398,25 @@ def get_harvest_explanation(
     )
 
     return {"explanation": response.choices[0].message.content}
+
+@app.post("/refresh-prices")
+def refresh_prices(db: Session = Depends(get_db)):
+    securities = db.query(SecurityDB).all()
+
+    updated = []
+    for security in securities:
+        ticker = yf.Ticker(security.symbol)
+        data = ticker.history(period="1d")
+
+        if data.empty:
+            continue  # no data returned for this symbol, skip it
+
+        latest_close = float(data["Close"].iloc[-1])
+        security.latest_price = Decimal(str(round(latest_close, 2)))
+        updated.append({
+            "symbol": security.symbol,
+            "latest_price": security.latest_price,
+        })
+
+    db.commit()
+    return {"updated": updated}
