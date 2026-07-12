@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 
 from app.database import get_db
 from app.model import TransactionDB, SecurityDB, TaxLotDB, RealizedGainDB
+from app.celery_app import celery_app, refresh_prices, redis_client
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -18,7 +19,6 @@ app = FastAPI()
 
 SHORT_TERM_TAX_RATE = Decimal("0.40")  # default: ~35% federal + ~5% GA
 LONG_TERM_TAX_RATE = Decimal("0.20")   # default: ~15% federal + ~5% GA
-LAST_PRICE_REFRESH = None
 
 
 class Transaction(BaseModel):
@@ -494,28 +494,20 @@ def get_harvest_explanation(
 
 
 @app.post("/refresh-prices")
-def refresh_prices(db: Session = Depends(get_db)):
-    global LAST_PRICE_REFRESH
-    securities = db.query(SecurityDB).all()
+def start_refreshing_prices():
+    job = refresh_prices.delay()
+    return {"job_id": job.id}
 
-    updated = []
-    for security in securities:
-        ticker = yf.Ticker(security.symbol)
-        data = ticker.history(period="1d")
 
-        if data.empty:
-            continue
-
-        latest_close = float(data["Close"].iloc[-1])
-        security.latest_price = Decimal(str(round(latest_close, 2)))
-        updated.append({
-            "symbol": security.symbol,
-            "latest_price": security.latest_price,
-        })
-
-    db.commit()
-    LAST_PRICE_REFRESH = datetime.now(timezone.utc).isoformat()
-    return {"updated": updated}
+@app.get("/jobs/{job_id}")
+def get_job_status(job_id: str):
+    # Check on a background job by its id.
+    result = celery_app.AsyncResult(job_id)
+    return {
+        "job_id": job_id,
+        "status": result.status,  # PENDING, STARTED, SUCCESS, FAILURE
+        "result": result.result if result.successful() else None,
+    }
 
 
 @app.get("/price-history/{symbol}")
@@ -580,6 +572,9 @@ def get_portfolio_summary(
 
     useful_loss_budget = max(realized_total, Decimal("0")) + Decimal("3000")
 
+    raw = redis_client.get("prices_last_refreshed")
+    prices_as_of = raw.decode() if raw else None
+
     return {
         "total_market_value": total_market_value,
         "total_cost_basis": total_cost_basis,
@@ -590,7 +585,7 @@ def get_portfolio_summary(
         "harvestable_recommended_loss": harvestable_loss,
         "harvestable_recommended_savings": harvestable_savings,
         "useful_loss_budget": useful_loss_budget,
-        "prices_as_of": LAST_PRICE_REFRESH,
+        "prices_as_of": prices_as_of,
     }
 
 
