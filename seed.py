@@ -18,7 +18,6 @@ securities = [
     {"symbol": "ETH-USD", "name": "Ethereum",             "asset_class": "crypto", "currency": "USD", "sector": "crypto"},
 ]
 
-# symbol: (quantity, cost multiplier vs. live price, buy date)
 buys = {
     "AAPL":    (40,  0.55, "2021-03-15"),
     "MSFT":    (15,  1.25, "2024-02-10"),
@@ -42,6 +41,7 @@ sells = {
     "AAPL": (10, "2026-05-01"),  # long-term gain
     "JPM":  (10, "2026-02-20"),  # gain
     "XOM":  (20, "2026-04-10"),  # short-term loss
+    "MSFT": (5, "2026-05-01")
 }
 
 # 1. add securities
