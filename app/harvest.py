@@ -10,13 +10,10 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
 
     today = date.today()
     opportunities = []
+    securities_by_symbol = {s.symbol: s for s in db.query(SecurityDB).all()}
 
     for lot in open_lots:
-        security = (
-            db.query(SecurityDB)
-            .filter(SecurityDB.symbol == lot.symbol)
-            .first()
-        )
+        security = securities_by_symbol.get(lot.symbol)
         if security is None or security.latest_price is None:
             continue
 
