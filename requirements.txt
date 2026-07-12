@@ -1,0 +1,11 @@
+fastapi==0.128.8
+groq==1.0.0
+pydantic==2.13.4
+yfinance==1.2.0
+uvicorn==0.39.0
+alembic==1.16.5
+SQLAlchemy==2.0.51
+psycopg2-binary==2.9.12
+python-dotenv==1.2.1
+pytest==8.4.2
+httpx==0.28.1

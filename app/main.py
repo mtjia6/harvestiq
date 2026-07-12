@@ -91,7 +91,7 @@ def process_transaction(transaction: Transaction, db: Session):
     )
 
     db.add(db_transaction)
-    db.commit()
+    db.flush()
     db.refresh(db_transaction)
 
     if transaction.transaction_type == "BUY":
@@ -108,7 +108,6 @@ def process_transaction(transaction: Transaction, db: Session):
             status="open",
         )
         db.add(lot)
-        db.commit()
 
     if transaction.transaction_type == "SELL":
         quantity_to_sell = transaction.quantity
@@ -147,8 +146,7 @@ def process_transaction(transaction: Transaction, db: Session):
             )
             db.add(realized)
 
-        db.commit()
-
+    db.commit()
     return {"message": "Transaction saved"}
 
 
