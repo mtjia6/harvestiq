@@ -5,6 +5,11 @@ import yfinance as yf
 from decimal import Decimal
 from datetime import datetime, timezone
 import redis
+from groq import Groq
+from app.harvest import build_harvest_opportunities
+from dotenv import load_dotenv
+
+load_dotenv()
 
 celery_app = Celery(
     "harvestiq",
@@ -48,3 +53,63 @@ def refresh_prices():
         return {"updated": updated}
     finally:
         db.close()
+
+def build_explanation_prompt(db, opportunities):
+    def replacements_for(symbol):
+        sec = db.query(SecurityDB).filter(SecurityDB.symbol == symbol).first()
+        if sec is None or sec.sector is None:
+            return []
+        alts = (
+            db.query(SecurityDB)
+            .filter(SecurityDB.sector == sec.sector)
+            .filter(SecurityDB.symbol != symbol)
+            .all()
+        )
+        return [a.symbol for a in alts]
+
+    lines = []
+    for o in opportunities:
+        reps = replacements_for(o["symbol"])
+        if o["recommended"]:
+            status = "recommended (no wash-sale risk)"
+        else:
+            status = f"WASH-SALE RISK: {o.get('wash_sale_reason') or 'a purchase within the last 30 days'}"
+        rep_txt = f"; possible replacements: {', '.join(reps)}" if reps else ""
+        lines.append(
+            f"- {o['symbol']}: {o['quantity_remaining']} units, unrealized loss {o['unrealized_loss']}, "
+            f"{o['term']}-term, estimated tax savings {o['estimated_tax_savings']}, {status}{rep_txt}"
+        )
+    summary = "\n".join(lines)
+
+    return (
+        "You are a concise financial assistant explaining tax-loss harvesting to a beginner. "
+        "Here are the harvest opportunities in the portfolio:\n\n"
+        f"{summary}\n\n"
+        "For each position, state the estimated tax saving and whether to act now. "
+        "If a position is a WASH-SALE RISK, explain the specific stated reason and that selling now would "
+        "DISALLOW the loss, so they should wait until the 30-day window passes or harvest a different position; "
+        "recommend the listed replacement tickers if provided. "
+        "Do NOT use vague phrasing like 'or will buy one within 30 days' — use the actual reason given. "
+        "Be specific and concise. End with exactly one line: 'This is not personalized tax advice.'"
+    )
+
+@celery_app.task
+def generate_harvest_explanation(short_term_rate, long_term_rate):
+    db = SessionLocal()
+    try:
+        opportunities = build_harvest_opportunities(
+            db, Decimal(short_term_rate), Decimal(long_term_rate)
+        )
+        if not opportunities:
+            return {"explanation": "No harvesting opportunities right now — none of your open lots are at a loss."}
+        prompt = build_explanation_prompt(db, opportunities)
+        client = Groq()
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return {"explanation": response.choices[0].message.content}
+    finally:
+        db.close()
+

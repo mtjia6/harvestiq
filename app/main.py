@@ -10,7 +10,8 @@ from fastapi.responses import FileResponse
 
 from app.database import get_db
 from app.model import TransactionDB, SecurityDB, TaxLotDB, RealizedGainDB
-from app.celery_app import celery_app, refresh_prices, redis_client
+from app.celery_app import celery_app, refresh_prices, redis_client, generate_harvest_explanation
+from app.harvest import build_harvest_opportunities
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -351,80 +352,6 @@ def get_wash_sales(db: Session = Depends(get_db)):
     return results
 
 
-def build_harvest_opportunities(db, short_term_rate, long_term_rate):
-    open_lots = (
-        db.query(TaxLotDB)
-        .filter(TaxLotDB.status == "open")
-        .all()
-    )
-
-    today = date.today()
-    opportunities = []
-
-    for lot in open_lots:
-        security = (
-            db.query(SecurityDB)
-            .filter(SecurityDB.symbol == lot.symbol)
-            .first()
-        )
-        if security is None or security.latest_price is None:
-            continue
-
-        market_value = lot.quantity_remaining * security.latest_price
-        cost_basis = lot.quantity_remaining * lot.cost_basis_per_unit
-        unrealized = market_value - cost_basis
-
-        if unrealized >= 0:
-            continue
-
-        holding_days = (today - lot.opened_date).days
-        if holding_days > 365:
-            term = "long"
-            tax_rate = long_term_rate
-        else:
-            term = "short"
-            tax_rate = short_term_rate
-
-        estimated_tax_savings = -unrealized * tax_rate
-
-        # Wash-sale rule applies to securities, not crypto (treated as property).
-        if security.asset_class == "crypto":
-            wash_sale_risk = False
-            wash_sale_reason = None
-        else:
-            window_start = today - timedelta(days=30)
-            recent_buy = (
-                db.query(TransactionDB)
-                .filter(TransactionDB.symbol == lot.symbol)
-                .filter(TransactionDB.transaction_type == "BUY")
-                .filter(TransactionDB.trade_date >= window_start)
-                .first()
-            )
-            wash_sale_risk = recent_buy is not None
-            wash_sale_reason = (
-                f"you bought {lot.symbol} on {recent_buy.trade_date}, within the last 30 days"
-                if recent_buy else None
-            )
-
-        opportunities.append({
-            "lot_id": lot.id,
-            "symbol": lot.symbol,
-            "asset_class": security.asset_class,
-            "quantity_remaining": lot.quantity_remaining,
-            "cost_basis": cost_basis,
-            "market_value": market_value,
-            "unrealized_loss": unrealized,
-            "term": term,
-            "estimated_tax_savings": estimated_tax_savings,
-            "wash_sale_risk": wash_sale_risk,
-            "wash_sale_reason": wash_sale_reason,
-            "recommended": not wash_sale_risk,
-        })
-
-    opportunities.sort(key=lambda o: o["estimated_tax_savings"], reverse=True)
-    return opportunities
-
-
 @app.get("/harvest-opportunities")
 def get_harvest_opportunities(
     short_term_rate: Decimal = SHORT_TERM_TAX_RATE,
@@ -437,60 +364,10 @@ def get_harvest_opportunities(
 @app.get("/harvest-explanation")
 def get_harvest_explanation(
     short_term_rate: Decimal = SHORT_TERM_TAX_RATE,
-    long_term_rate: Decimal = LONG_TERM_TAX_RATE,
-    db: Session = Depends(get_db),
+    long_term_rate: Decimal = LONG_TERM_TAX_RATE
 ):
-    opportunities = build_harvest_opportunities(db, short_term_rate, long_term_rate)
-
-    if not opportunities:
-        return {"explanation": "No harvesting opportunities right now — none of your open lots are at a loss."}
-
-    def replacements_for(symbol):
-        sec = db.query(SecurityDB).filter(SecurityDB.symbol == symbol).first()
-        if sec is None or sec.sector is None:
-            return []
-        alts = (
-            db.query(SecurityDB)
-            .filter(SecurityDB.sector == sec.sector)
-            .filter(SecurityDB.symbol != symbol)
-            .all()
-        )
-        return [a.symbol for a in alts]
-
-    lines = []
-    for o in opportunities:
-        reps = replacements_for(o["symbol"])
-        if o["recommended"]:
-            status = "recommended (no wash-sale risk)"
-        else:
-            status = f"WASH-SALE RISK: {o.get('wash_sale_reason') or 'a purchase within the last 30 days'}"
-        rep_txt = f"; possible replacements: {', '.join(reps)}" if reps else ""
-        lines.append(
-            f"- {o['symbol']}: {o['quantity_remaining']} units, unrealized loss {o['unrealized_loss']}, "
-            f"{o['term']}-term, estimated tax savings {o['estimated_tax_savings']}, {status}{rep_txt}"
-        )
-    summary = "\n".join(lines)
-
-    prompt = (
-        "You are a concise financial assistant explaining tax-loss harvesting to a beginner. "
-        "Here are the harvest opportunities in the portfolio:\n\n"
-        f"{summary}\n\n"
-        "For each position, state the estimated tax saving and whether to act now. "
-        "If a position is a WASH-SALE RISK, explain the specific stated reason and that selling now would "
-        "DISALLOW the loss, so they should wait until the 30-day window passes or harvest a different position; "
-        "recommend the listed replacement tickers if provided. "
-        "Do NOT use vague phrasing like 'or will buy one within 30 days' — use the actual reason given. "
-        "Be specific and concise. End with exactly one line: 'This is not personalized tax advice.'"
-    )
-
-    client = Groq()
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
-        max_tokens=800,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    return {"explanation": response.choices[0].message.content}
+    job = generate_harvest_explanation.delay(str(short_term_rate), str(long_term_rate))
+    return {"job_id": job.id}
 
 
 @app.post("/refresh-prices")
