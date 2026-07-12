@@ -82,7 +82,7 @@ def build_explanation_prompt(db, opportunities):
     summary = "\n".join(lines)
 
     return (
-        "You are a concise financial assistant explaining tax-loss harvesting to a beginner. "
+        "You are a concise Wall Street-level financial assistant explaining tax-loss harvesting to a beginner. "
         "Here are the harvest opportunities in the portfolio:\n\n"
         f"{summary}\n\n"
         "For each position, state the estimated tax saving and whether to act now. "
