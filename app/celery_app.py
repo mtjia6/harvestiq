@@ -5,6 +5,7 @@ import yfinance as yf
 from decimal import Decimal
 from datetime import datetime, timezone
 import redis
+import json
 from groq import Groq
 from app.harvest import build_harvest_opportunities
 from dotenv import load_dotenv
@@ -50,6 +51,7 @@ def refresh_prices():
             "prices_last_refreshed",
             datetime.now(timezone.utc).isoformat(),
         )
+        run_tax_analysis.delay()
         return {"updated": updated}
     finally:
         db.close()
@@ -94,12 +96,13 @@ def build_explanation_prompt(db, opportunities):
     )
 
 @celery_app.task
-def generate_harvest_explanation(short_term_rate, long_term_rate):
+def generate_harvest_explanation():
     db = SessionLocal()
     try:
-        opportunities = build_harvest_opportunities(
-            db, Decimal(short_term_rate), Decimal(long_term_rate)
-        )
+        raw = redis_client.get("tax_analysis")
+        if raw is None:
+            return {"explanation": "No analysis available yet — run POST /tax-analysis/run first."}
+        opportunities = json.loads(raw)["opportunities"]
         if not opportunities:
             return {"explanation": "No harvesting opportunities right now — none of your open lots are at a loss."}
         prompt = build_explanation_prompt(db, opportunities)
@@ -110,6 +113,19 @@ def generate_harvest_explanation(short_term_rate, long_term_rate):
             messages=[{"role": "user", "content": prompt}],
         )
         return {"explanation": response.choices[0].message.content}
+    finally:
+        db.close()
+
+@celery_app.task
+def run_tax_analysis(short_term_rate="0.40", long_term_rate="0.20"):
+    db = SessionLocal()
+    try:
+        opportunities = build_harvest_opportunities(db, Decimal(short_term_rate), Decimal(long_term_rate))
+        generated_at = datetime.now(timezone.utc).isoformat()
+
+        result = {"opportunities": opportunities, "generated_at": generated_at}
+        redis_client.set("tax_analysis", json.dumps(result, default=str))
+        return {"count": len(opportunities)}
     finally:
         db.close()
 

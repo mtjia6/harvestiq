@@ -5,12 +5,13 @@ from typing import Literal
 from datetime import date, timedelta, datetime, timezone
 from decimal import Decimal
 from groq import Groq
+import json
 import yfinance as yf
 from fastapi.responses import FileResponse
 
 from app.database import get_db
 from app.model import TransactionDB, SecurityDB, TaxLotDB, RealizedGainDB
-from app.celery_app import celery_app, refresh_prices, redis_client, generate_harvest_explanation
+from app.celery_app import celery_app, refresh_prices, redis_client, generate_harvest_explanation, run_tax_analysis
 from app.harvest import build_harvest_opportunities
 
 from dotenv import load_dotenv
@@ -362,12 +363,28 @@ def get_harvest_opportunities(
 
 
 @app.get("/harvest-explanation")
-def get_harvest_explanation(
-    short_term_rate: Decimal = SHORT_TERM_TAX_RATE,
-    long_term_rate: Decimal = LONG_TERM_TAX_RATE
-):
-    job = generate_harvest_explanation.delay(str(short_term_rate), str(long_term_rate))
+def get_harvest_explanation():
+    job = generate_harvest_explanation.delay()
     return {"job_id": job.id}
+
+
+@app.post("/tax-analysis/run")
+def start_tax_analysis(
+    short_term_rate: Decimal = SHORT_TERM_TAX_RATE,
+    long_term_rate: Decimal = LONG_TERM_TAX_RATE,
+):
+    # Trigger a fresh recompute in the background; result gets cached in Redis.
+    job = run_tax_analysis.delay(str(short_term_rate), str(long_term_rate))
+    return {"job_id": job.id}
+
+
+@app.get("/tax-analysis")
+def get_tax_analysis():
+    # Serve the cached analysis instantly (no recompute).
+    raw = redis_client.get("tax_analysis")
+    if raw is None:
+        return {"status": "not_computed", "message": "Run POST /tax-analysis/run first."}
+    return json.loads(raw)
 
 
 @app.post("/refresh-prices")
