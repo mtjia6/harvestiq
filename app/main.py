@@ -5,8 +5,12 @@ from typing import Literal
 from datetime import date, timedelta, datetime, timezone
 from decimal import Decimal
 from groq import Groq
+import asyncio
+import contextlib
 import json
+import os
 import yfinance as yf
+from contextlib import asynccontextmanager
 from fastapi.responses import FileResponse
 from starlette.concurrency import run_in_threadpool
 import redis.asyncio as aioredis
@@ -19,7 +23,98 @@ from app.harvest import build_harvest_opportunities, get_ytd_realized_totals, bu
 from dotenv import load_dotenv
 load_dotenv()
 
-app = FastAPI()
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+# Floor on how often we rebuild + push the summary, in seconds. The streamer can
+# publish once a second all day; without this, every tick costs a full portfolio
+# recompute. Bursts inside the window collapse into a single push.
+MIN_PUSH_INTERVAL = float(os.getenv("WS_MIN_PUSH_INTERVAL", "2"))
+
+# How long one client may take to accept a push before we give up and drop it.
+# Stops a single stalled socket from holding up the broadcast to everyone else.
+CLIENT_SEND_TIMEOUT = 5.0
+
+# Every live /ws/prices socket. There is exactly ONE Redis subscription and ONE
+# summary computation per tick for this whole set - not one per client.
+price_clients = set()
+
+# Set by the Redis listener, consumed by the broadcaster. An Event (not a queue)
+# is what makes coalescing free: N publishes inside one window set the same flag.
+# Created inside the lifespan, NOT at import: an asyncio.Event binds to the first
+# running loop that awaits it, so a module-level one breaks the moment the app is
+# run on a second loop (tests, reload workers, an app restarted in-process).
+_price_dirty = None
+
+
+async def _aclose(obj):
+    # redis-py renamed the async close to aclose() in 5.x and deprecated close().
+    closer = getattr(obj, "aclose", None) or obj.close
+    await closer()
+
+
+async def _pubsub_listener(pubsub, dirty):
+    # Owns the single Redis subscription. Does no work beyond raising the flag,
+    # so a slow recompute can never back up the pub/sub connection.
+    async for message in pubsub.listen():
+        if message.get("type") == "message":
+            dirty.set()
+
+
+async def _broadcast(payload):
+    async def send(ws):
+        try:
+            await asyncio.wait_for(ws.send_text(payload), timeout=CLIENT_SEND_TIMEOUT)
+        except Exception:
+            # Dead or stalled client: drop it. The socket handler's finally block
+            # discards it too; set.discard is idempotent so the race is harmless.
+            price_clients.discard(ws)
+
+    await asyncio.gather(*(send(ws) for ws in list(price_clients)))
+
+
+async def _broadcaster(dirty):
+    # Single consumer: wait for a price change, rebuild the summary ONCE, fan it
+    # out to every client, then sleep out the rate-limit window.
+    while True:
+        await dirty.wait()
+        dirty.clear()
+        try:
+            if price_clients:  # nobody watching: skip the DB work entirely
+                payload = await run_in_threadpool(_summary_json)
+                await _broadcast(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # never let one bad tick kill the broadcaster
+            print("[ws] broadcast failed: %r" % (exc,))
+        await asyncio.sleep(MIN_PUSH_INTERVAL)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _price_dirty
+    _price_dirty = asyncio.Event()
+    redis_conn = aioredis.from_url(REDIS_URL)
+    pubsub = redis_conn.pubsub()
+    await pubsub.subscribe("prices")
+    tasks = [
+        asyncio.create_task(_pubsub_listener(pubsub, _price_dirty)),
+        asyncio.create_task(_broadcaster(_price_dirty)),
+    ]
+    try:
+        yield
+    finally:
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await pubsub.unsubscribe("prices")
+        await _aclose(pubsub)
+        await _aclose(redis_conn)
+        _price_dirty = None
+
+
+app = FastAPI(lifespan=lifespan)
 
 SHORT_TERM_TAX_RATE = Decimal("0.40")  # default: ~35% federal + ~5% GA
 LONG_TERM_TAX_RATE = Decimal("0.20")   # default: ~15% federal + ~5% GA
@@ -452,25 +547,32 @@ def get_portfolio_summary(db: Session = Depends(get_db)):
 
 @app.websocket("/ws/prices")
 async def ws_prices(websocket: WebSocket):
+    # This handler does NOT subscribe to Redis and does NOT compute summaries -
+    # the app-wide broadcaster does both, once, for everyone. All this coroutine
+    # does is register the client and then sit on receive(), so that a browser
+    # closing the tab is actually noticed.
     await websocket.accept()
-    r = aioredis.from_url("redis://localhost:6379/0")
-    pubsub = r.pubsub()
-    await pubsub.subscribe("prices")
+    price_clients.add(websocket)
     try:
         # Cold start: push the current summary immediately on connect, so a
         # freshly-loaded page renders without waiting for the next price change.
         await websocket.send_text(await run_in_threadpool(_summary_json))
-        # Then push a fresh summary every time the streamer publishes "updated".
-        async for message in pubsub.listen():
-            if message.get("type") != "message":
-                continue
-            await websocket.send_text(await run_in_threadpool(_summary_json))
+
+        # A client-initiated close arrives as a RECEIVE event in ASGI. Nothing
+        # else in this app reads from the socket, so if we never await receive()
+        # the disconnect is never delivered and this task leaks forever.
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
     except WebSocketDisconnect:
         pass
+    except RuntimeError:
+        # Starlette raises RuntimeError (not WebSocketDisconnect) when we touch a
+        # socket the server has already torn down. Same outcome: we are done.
+        pass
     finally:
-        await pubsub.unsubscribe("prices")
-        await pubsub.close()
-        await r.close()
+        price_clients.discard(websocket)
 
 
 @app.get("/replacement-suggestions")
