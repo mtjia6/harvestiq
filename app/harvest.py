@@ -58,6 +58,7 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
             "symbol": lot.symbol,
             "asset_class": security.asset_class,
             "quantity_remaining": lot.quantity_remaining,
+            "lot_broker": lot.broker,
             "cost_basis": cost_basis,
             "market_value": market_value,
             "unrealized_loss": unrealized,

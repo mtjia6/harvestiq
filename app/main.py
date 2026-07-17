@@ -71,6 +71,7 @@ def process_transaction(transaction: Transaction, db: Session):
             db.query(TaxLotDB)
             .filter(TaxLotDB.symbol == transaction.symbol)
             .filter(TaxLotDB.status == "open")
+            .filter(TaxLotDB.broker == transaction.broker)
             .order_by(TaxLotDB.opened_date)
             .all()
         )
@@ -106,6 +107,7 @@ def process_transaction(transaction: Transaction, db: Session):
             quantity_opened=transaction.quantity,
             quantity_remaining=transaction.quantity,
             cost_basis_per_unit=cost_basis_per_unit,
+            broker=transaction.broker,
             opened_date=transaction.trade_date,
             status="open",
         )

@@ -42,6 +42,7 @@ class TaxLotDB(Base):
     open_transaction_id: Mapped[int] = mapped_column(ForeignKey("transactions.id"))
     quantity_opened: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
     quantity_remaining: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
+    broker: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     cost_basis_per_unit: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
     opened_date: Mapped[datetime.date] = mapped_column(Date)
     status: Mapped[str] = mapped_column(String)
