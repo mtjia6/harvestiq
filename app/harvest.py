@@ -1,5 +1,6 @@
 from datetime import date, timedelta
-from app.model import SecurityDB, TaxLotDB, TransactionDB
+from app.model import SecurityDB, TaxLotDB, TransactionDB, RealizedGainDB
+from decimal import Decimal
 
 def build_harvest_opportunities(db, short_term_rate, long_term_rate):
     open_lots = (
@@ -11,6 +12,7 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
     today = date.today()
     opportunities = []
     securities_by_symbol = {s.symbol: s for s in db.query(SecurityDB).all()}
+    net_st, net_lt = get_ytd_realized_totals(db)
 
     for lot in open_lots:
         security = securities_by_symbol.get(lot.symbol)
@@ -27,12 +29,10 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
         holding_days = (today - lot.opened_date).days
         if holding_days > 365:
             term = "long"
-            tax_rate = long_term_rate
         else:
             term = "short"
-            tax_rate = short_term_rate
 
-        estimated_tax_savings = -unrealized * tax_rate
+        estimated_tax_savings = marginal_tax_savings(-unrealized, term, net_st, net_lt, short_term_rate, long_term_rate)
 
         # Wash-sale rule applies to securities, not crypto (treated as property).
         if security.asset_class == "crypto":
@@ -71,3 +71,42 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
 
     opportunities.sort(key=lambda o: o["estimated_tax_savings"], reverse=True)
     return opportunities
+
+def get_ytd_realized_totals(db):
+    today = date.today()
+    year_start = date(today.year, 1, 1)
+
+    realized = (
+        db.query(RealizedGainDB)
+        .filter(RealizedGainDB.sell_date>=year_start)
+        .all()
+    )
+
+    realized_short = sum((r.gain_loss for r in realized if r.term == "short"), Decimal("0"))
+    realized_long = sum((r.gain_loss for r in realized if r.term == "long"), Decimal("0"))
+    return realized_short, realized_long
+    
+def tax_owed(net_st, net_lt, short_rate, long_rate):
+    tax = 0
+    if (net_st >= 0 and net_lt >= 0):
+        tax = (net_st * short_rate) + (net_lt * long_rate)
+    elif (net_st + net_lt < 0):
+        pass
+    elif (net_st < 0 and net_lt >= 0):
+        tax = (net_lt + net_st) * long_rate
+    elif (net_st >= 0 and net_lt < 0):
+        tax = (net_st + net_lt) * short_rate
+
+    return tax
+
+def marginal_tax_savings(loss_amount, term, net_st, net_lt, short_rate, long_rate):
+    before = tax_owed(net_st, net_lt, short_rate, long_rate)
+    tax = 0
+    if (term == "long"):
+        tax = tax_owed(net_st, net_lt - loss_amount, short_rate, long_rate)
+    elif (term == "short"):
+        tax = tax_owed(net_st - loss_amount, net_lt, short_rate, long_rate)
+
+    if net_st <= 0 and net_lt <= 0: return loss_amount * short_rate
+    
+    return before - tax

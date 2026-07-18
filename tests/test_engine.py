@@ -136,5 +136,7 @@ def test_harvest_savings_uses_rate():
     ).json()
     aapl = [o for o in opps if o["symbol"] == "AAPL"][0]
     assert float(aapl["unrealized_loss"]) == pytest.approx(-200)   # 10 * (130 - 150)
-    assert float(aapl["estimated_tax_savings"]) == pytest.approx(10)  # 200 * 0.05
+    # No realized gains anywhere this year (fresh test DB), so this loss has
+    # nothing to net against -> falls back to the ordinary-income rate (short_rate).
+    assert float(aapl["estimated_tax_savings"]) == pytest.approx(30)  # 200 * 0.15
     assert aapl["term"] == "long"

@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from app.database import get_db
 from app.model import TransactionDB, SecurityDB, TaxLotDB, RealizedGainDB
 from app.celery_app import celery_app, refresh_prices, redis_client, generate_harvest_explanation, run_tax_analysis
-from app.harvest import build_harvest_opportunities
+from app.harvest import build_harvest_opportunities, get_ytd_realized_totals
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -450,15 +450,7 @@ def get_portfolio_summary(
 
     total_unrealized = total_market_value - total_cost_basis
 
-    today = date.today()
-    year_start = date(today.year, 1, 1)
-    realized = (
-        db.query(RealizedGainDB)
-        .filter(RealizedGainDB.sell_date >= year_start)
-        .all()
-    )
-    realized_short = sum((r.gain_loss for r in realized if r.term == "short"), Decimal("0"))
-    realized_long = sum((r.gain_loss for r in realized if r.term == "long"), Decimal("0"))
+    realized_short, realized_long = get_ytd_realized_totals(db)
     realized_total = realized_short + realized_long
 
     opps = build_harvest_opportunities(db, short_term_rate, long_term_rate)
