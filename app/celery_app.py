@@ -6,6 +6,8 @@ from decimal import Decimal
 from datetime import datetime, timezone
 import redis
 import json
+import requests
+import os
 from groq import Groq
 from app.harvest import build_harvest_opportunities
 from dotenv import load_dotenv
