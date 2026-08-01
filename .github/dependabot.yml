@@ -1,0 +1,15 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"        # pip, gomod, cargo, maven, bundler, docker, etc.
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:                          # bundle updates into one PR to cut noise
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "github-actions"   # worth adding to every repo
+    directory: "/"
+    schedule:
+      interval: "weekly"
