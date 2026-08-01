@@ -1,15 +1,51 @@
+# .github/dependabot.yml
+# Dependabot configuration for harvestiq
+# Docs: https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference
 version: 2
 updates:
-  - package-ecosystem: "npm"        # pip, gomod, cargo, maven, bundler, docker, etc.
+  - package-ecosystem: "pip"
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Singapore"
     open-pull-requests-limit: 5
-    groups:                          # bundle updates into one PR to cut noise
+    commit-message:
+      prefix: "deps"
+      prefix-development: "deps-dev"
+    labels:
+      - "dependencies"
+    groups:
+      # One PR per week for all safe (non-breaking) bumps.
       minor-and-patch:
-        update-types: ["minor", "patch"]
+        update-types:
+          - "minor"
+          - "patch"
+      # Test tooling moves together and is low-risk.
+      dev-tooling:
+        patterns:
+          - "pytest*"
+          - "httpx"
+        update-types:
+          - "major"
+          - "minor"
+          - "patch"
+    ignore:
+      # Major bumps here are migration work, not a merge-the-PR job.
+      # Security updates still come through regardless of this ignore.
+      - dependency-name: "SQLAlchemy"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "pydantic"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "celery"
+        update-types: ["version-update:semver-major"]
 
-  - package-ecosystem: "github-actions"   # worth adding to every repo
+  # Keeps any future CI workflow actions pinned and current.
+  - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
+    labels:
+      - "dependencies"
+      - "ci"
