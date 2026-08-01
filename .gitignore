@@ -2,4 +2,6 @@ venv/
 __pycache__/
 .env
 .DS_Store
-AGENT_HANDOFF.md
+CLAUDE.md
+ThingsWeDid.md
+tax_harvesting_notes.md
