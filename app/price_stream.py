@@ -8,7 +8,7 @@ from decimal import Decimal
 from app.database import SessionLocal
 from app.model import SecurityDB
 from dotenv import load_dotenv
-from app.celery_app import run_tax_analysis
+from app.celery_app import run_tax_analysis, redis_client
 
 latest = {}
 load_dotenv()
@@ -38,6 +38,7 @@ def on_close(ws, close_status_code, close_msg):
     print("closed")
 
 def flush_prices(): #reads of the array "latest" and store it to the db. we cshould not do storing of db in on_message because on_message runs very quickly. It receives data and stores it in the array every milisecond, if we have a commit there, we would stall it or delay it from getting the newwest data of the next milisecond.
+    last_published = {}
     while True:
         time.sleep(1)
         db = SessionLocal()
@@ -49,6 +50,13 @@ def flush_prices(): #reads of the array "latest" and store it to the db. we csho
             db.commit()
         finally:
             db.close()
+
+        # Notify subscribers (the FastAPI websocket) that prices changed, but
+        # only when they actually did — silence when the feed is quiet.
+        snapshot = dict(latest)
+        if snapshot != last_published:
+            redis_client.publish("prices", "updated")
+            last_published = snapshot
 
 def recompute_tax_loop():
     while True:

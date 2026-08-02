@@ -125,9 +125,7 @@ function money(n) {
 }
 function cls(n) { return Number(n) < 0 ? 'red' : 'green'; }
 
-async function loadSummary() {
-  const res = await fetch(`/portfolio-summary?${rates()}`);
-  const s = await res.json();
+function renderSummary(s) {
   document.getElementById('s_value').textContent = money(s.total_market_value);
   const u = document.getElementById('s_unrealized');
   u.textContent = money(s.total_unrealized_gain_loss); u.className = 'value ' + cls(s.total_unrealized_gain_loss);
@@ -139,6 +137,12 @@ async function loadSummary() {
   document.getElementById('asOf').textContent = s.prices_as_of
     ? 'Prices as of ' + new Date(s.prices_as_of).toLocaleString()
     : 'Prices not yet refreshed';
+}
+
+// One-shot fetch, used on initial load. After that the websocket pushes updates.
+async function loadSummary() {
+  const res = await fetch(`/portfolio-summary?${rates()}`);
+  renderSummary(await res.json());
 }
 
 async function loadPortfolio() {
@@ -293,6 +297,15 @@ async function refreshPrices() {
 function reloadAll() { loadSummary(); loadPortfolio(); loadOpportunities(); loadRealized(); }
 reloadAll();
 loadSecuritiesIntoSelect();
+
+// Live summary: the server pushes a fresh summary over the websocket whenever
+// the streamer reports a price change. renderSummary paints it — no refetch.
+function connectPrices() {
+  const ws = new WebSocket(`ws://${location.host}/ws/prices`);
+  ws.onmessage = (e) => renderSummary(JSON.parse(e.data));
+  ws.onclose = () => setTimeout(connectPrices, 2000);  // socket dropped: reconnect
+}
+connectPrices();
 </script>
 </body>
 </html>

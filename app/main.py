@@ -1,4 +1,4 @@
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from typing import Literal
@@ -8,11 +8,13 @@ from groq import Groq
 import json
 import yfinance as yf
 from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
+import redis.asyncio as aioredis
 
-from app.database import get_db
+from app.database import get_db, SessionLocal
 from app.model import TransactionDB, SecurityDB, TaxLotDB, RealizedGainDB
 from app.celery_app import celery_app, redis_client, generate_harvest_explanation, run_tax_analysis
-from app.harvest import build_harvest_opportunities, get_ytd_realized_totals
+from app.harvest import build_harvest_opportunities, get_ytd_realized_totals, build_portfolio_summary
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -419,56 +421,56 @@ def get_price_history(symbol: str, days: int = 90):
     return {"symbol": symbol, "history": history}
 
 
+def _build_summary(db):
+    # Read the cached harvest opportunities (Redis) and hand them to the pure
+    # summary computation in harvest.py. Both the HTTP endpoint and the
+    # websocket push call this, so the math lives in exactly one place.
+    raw = redis_client.get("tax_analysis")
+    opportunities = json.loads(raw)["opportunities"] if raw else []
+    summary = build_portfolio_summary(db, opportunities)
+    raw_ts = redis_client.get("prices_last_refreshed")
+    summary["prices_as_of"] = raw_ts.decode() if raw_ts else None
+    return summary
+
+
+def _summary_json():
+    # Sync helper for the websocket. Opens its own session (it's not in a
+    # request, so there's no Depends(get_db)), builds the summary, JSON-encodes
+    # with default=str for the Decimals. Runs in a threadpool so this blocking
+    # DB work never stalls the async event loop.
+    db = SessionLocal()
+    try:
+        return json.dumps(_build_summary(db), default=str)
+    finally:
+        db.close()
+
+
 @app.get("/portfolio-summary")
-def get_portfolio_summary(
-    short_term_rate: Decimal = SHORT_TERM_TAX_RATE,
-    long_term_rate: Decimal = LONG_TERM_TAX_RATE,
-    db: Session = Depends(get_db),
-):
-    open_lots = db.query(TaxLotDB).filter(TaxLotDB.status == "open").all()
+def get_portfolio_summary(db: Session = Depends(get_db)):
+    return _build_summary(db)
 
-    total_market_value = Decimal("0")
-    total_cost_basis = Decimal("0")
-    for lot in open_lots:
-        security = (
-            db.query(SecurityDB)
-            .filter(SecurityDB.symbol == lot.symbol)
-            .first()
-        )
-        cost = lot.quantity_remaining * lot.cost_basis_per_unit
-        total_cost_basis += cost
-        if security and security.latest_price is not None:
-            total_market_value += lot.quantity_remaining * security.latest_price
-        else:
-            total_market_value += cost  # no price yet: value at cost
 
-    total_unrealized = total_market_value - total_cost_basis
-
-    realized_short, realized_long = get_ytd_realized_totals(db)
-    realized_total = realized_short + realized_long
-
-    opps = build_harvest_opportunities(db, short_term_rate, long_term_rate)
-    rec = [o for o in opps if o["recommended"]]
-    harvestable_savings = sum((o["estimated_tax_savings"] for o in rec), Decimal("0"))
-    harvestable_loss = sum((-o["unrealized_loss"] for o in rec), Decimal("0"))
-
-    useful_loss_budget = max(realized_total, Decimal("0")) + Decimal("3000")
-
-    raw = redis_client.get("prices_last_refreshed")
-    prices_as_of = raw.decode() if raw else None
-
-    return {
-        "total_market_value": total_market_value,
-        "total_cost_basis": total_cost_basis,
-        "total_unrealized_gain_loss": total_unrealized,
-        "realized_ytd_short": realized_short,
-        "realized_ytd_long": realized_long,
-        "realized_ytd_total": realized_total,
-        "harvestable_recommended_loss": harvestable_loss,
-        "harvestable_recommended_savings": harvestable_savings,
-        "useful_loss_budget": useful_loss_budget,
-        "prices_as_of": prices_as_of,
-    }
+@app.websocket("/ws/prices")
+async def ws_prices(websocket: WebSocket):
+    await websocket.accept()
+    r = aioredis.from_url("redis://localhost:6379/0")
+    pubsub = r.pubsub()
+    await pubsub.subscribe("prices")
+    try:
+        # Cold start: push the current summary immediately on connect, so a
+        # freshly-loaded page renders without waiting for the next price change.
+        await websocket.send_text(await run_in_threadpool(_summary_json))
+        # Then push a fresh summary every time the streamer publishes "updated".
+        async for message in pubsub.listen():
+            if message.get("type") != "message":
+                continue
+            await websocket.send_text(await run_in_threadpool(_summary_json))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await pubsub.unsubscribe("prices")
+        await pubsub.close()
+        await r.close()
 
 
 @app.get("/replacement-suggestions")

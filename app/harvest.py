@@ -72,6 +72,49 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
     opportunities.sort(key=lambda o: o["estimated_tax_savings"], reverse=True)
     return opportunities
 
+def build_portfolio_summary(db, opportunities):
+    # Pure computation of the dashboard summary. `opportunities` is the cached
+    # harvest list (already parsed from Redis by the caller); this function does
+    # NOT touch Redis, so harvest.py stays free of celery/redis imports.
+    open_lots = db.query(TaxLotDB).filter(TaxLotDB.status == "open").all()
+    securities_by_symbol = {s.symbol: s for s in db.query(SecurityDB).all()}
+
+    total_market_value = Decimal("0")
+    total_cost_basis = Decimal("0")
+    for lot in open_lots:
+        cost = lot.quantity_remaining * lot.cost_basis_per_unit
+        total_cost_basis += cost
+        security = securities_by_symbol.get(lot.symbol)
+        if security and security.latest_price is not None:
+            total_market_value += lot.quantity_remaining * security.latest_price
+        else:
+            total_market_value += cost  # no price yet: value at cost
+
+    total_unrealized = total_market_value - total_cost_basis
+
+    realized_short, realized_long = get_ytd_realized_totals(db)
+    realized_total = realized_short + realized_long
+
+    # Values from the cache are strings; str() is a no-op on a Decimal, so this
+    # works whether opportunities came from Redis (strings) or a fresh compute.
+    rec = [o for o in opportunities if o["recommended"]]
+    harvestable_savings = sum((Decimal(str(o["estimated_tax_savings"])) for o in rec), Decimal("0"))
+    harvestable_loss = sum((-Decimal(str(o["unrealized_loss"])) for o in rec), Decimal("0"))
+
+    useful_loss_budget = max(realized_total, Decimal("0")) + Decimal("3000")
+
+    return {
+        "total_market_value": total_market_value,
+        "total_cost_basis": total_cost_basis,
+        "total_unrealized_gain_loss": total_unrealized,
+        "realized_ytd_short": realized_short,
+        "realized_ytd_long": realized_long,
+        "realized_ytd_total": realized_total,
+        "harvestable_recommended_loss": harvestable_loss,
+        "harvestable_recommended_savings": harvestable_savings,
+        "useful_loss_budget": useful_loss_budget,
+    }
+
 def get_ytd_realized_totals(db):
     today = date.today()
     year_start = date(today.year, 1, 1)
