@@ -8,6 +8,7 @@ from decimal import Decimal
 from app.database import SessionLocal
 from app.model import SecurityDB
 from dotenv import load_dotenv
+from app.celery_app import run_tax_analysis
 
 latest = {}
 load_dotenv()
@@ -49,11 +50,17 @@ def flush_prices(): #reads of the array "latest" and store it to the db. we csho
         finally:
             db.close()
 
+def recompute_tax_loop():
+    while True:
+        time.sleep(30)
+        run_tax_analysis.delay()
+
 def main():
     url = f"wss://ws.finnhub.io?token={os.getenv('FINNHUB_API_KEY')}"
 
     ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
     threading.Thread(target=flush_prices, daemon=True).start()
+    threading.Thread(target=recompute_tax_loop, daemon=True).start()
     ws.run_forever()
 
 if __name__ == "__main__":

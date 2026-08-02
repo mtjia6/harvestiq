@@ -29,35 +29,6 @@ def add(x: int, y: int):
     return x + y
 
 
-@celery_app.task
-def refresh_prices():
-    db = SessionLocal()
-    try:
-        securities = db.query(SecurityDB).all()
-        updated = []
-        for security in securities:
-            ticker = yf.Ticker(security.symbol)
-            data = ticker.history(period="1d")
-
-            if data.empty:
-                continue
-
-            latest_close = float(data["Close"].iloc[-1])
-            security.latest_price = Decimal(str(round(latest_close, 2)))
-            updated.append({
-                "symbol": security.symbol,
-                "latest_price": float(security.latest_price),
-            })
-        db.commit()
-        redis_client.set(
-            "prices_last_refreshed",
-            datetime.now(timezone.utc).isoformat(),
-        )
-        run_tax_analysis.delay()
-        return {"updated": updated}
-    finally:
-        db.close()
-
 def build_explanation_prompt(db, opportunities):
     def replacements_for(symbol):
         sec = db.query(SecurityDB).filter(SecurityDB.symbol == symbol).first()

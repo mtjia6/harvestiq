@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from app.database import get_db
 from app.model import TransactionDB, SecurityDB, TaxLotDB, RealizedGainDB
-from app.celery_app import celery_app, refresh_prices, redis_client, generate_harvest_explanation, run_tax_analysis
+from app.celery_app import celery_app, redis_client, generate_harvest_explanation, run_tax_analysis
 from app.harvest import build_harvest_opportunities, get_ytd_realized_totals
 
 from dotenv import load_dotenv
@@ -387,12 +387,6 @@ def get_tax_analysis():
     if raw is None:
         return {"status": "not_computed", "message": "Run POST /tax-analysis/run first."}
     return json.loads(raw)
-
-
-@app.post("/refresh-prices")
-def start_refreshing_prices():
-    job = refresh_prices.delay()
-    return {"job_id": job.id}
 
 
 @app.get("/jobs/{job_id}")
