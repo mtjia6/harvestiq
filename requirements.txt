@@ -1,8 +1,8 @@
-fastapi==0.140.13
+fastapi==0.141.1
 groq==1.6.0
 pydantic==2.13.4
 yfinance==1.5.2
-uvicorn==0.51.0
+uvicorn==0.52.0
 alembic==1.18.5
 SQLAlchemy==2.0.51
 psycopg2-binary==2.9.12
