@@ -1,12 +1,10 @@
 from celery import Celery
 from app.database import SessionLocal
 from app.model import SecurityDB
-import yfinance as yf
 from decimal import Decimal
 from datetime import datetime, timezone
 import redis
 import json
-import requests
 import os
 from groq import Groq
 from app.harvest import build_harvest_opportunities
