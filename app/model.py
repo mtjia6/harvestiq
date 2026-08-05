@@ -27,7 +27,13 @@ class SecurityDB(Base):
     __tablename__ = "securities"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # `symbol` is canonical and is the FINNHUB symbol (e.g. "AAPL",
+    # "BINANCE:BTCUSDT") because that's what the live stream subscribes to.
     symbol: Mapped[str] = mapped_column(String, unique=True)
+    # Yahoo uses a different convention for anything that isn't a plain US
+    # equity ("BTC-USD" vs "BINANCE:BTCUSDT"), and Yahoo is our only source
+    # of historical bars. Null means the canonical symbol works as-is.
+    history_symbol: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     name: Mapped[str] = mapped_column(String)
     asset_class: Mapped[str] = mapped_column(String)
     currency: Mapped[str] = mapped_column(String)

@@ -17,7 +17,9 @@ When you sell an investment for less than you paid, that **capital loss** can of
 ## Features
 
 - **Transaction recording & validation** — buys/sells with type, quantity, price, date; rejects bad data and unknown symbols.
-- **Security master** — a canonical catalog of tradable assets (equity or crypto), each with a sector.
+- **Security master** — a canonical catalog of tradable assets (equity or crypto),
+  each with a sector. Symbols are stored in Finnhub form, with a `history_symbol`
+  override for instruments Yahoo names differently (e.g. `BINANCE:BTCUSDT` vs `BTC-USD`).
 - **Tax-lot tracking** — every purchase is its own lot with fee-inclusive cost basis.
 - **FIFO cost basis** — sells consume the oldest lots first, with an oversell guard.
 - **Realized gains/losses** — computed on sale, classified short- vs long-term by holding period.
@@ -26,7 +28,8 @@ When you sell an investment for less than you paid, that **capital loss** can of
 - **Harvest opportunity ranking** — ranks losing positions by estimated tax savings using *configurable* tax rates.
 - **Replacement suggestions** — same-sector, different-symbol alternatives to avoid wash sales.
 - **AI explanations** — natural-language harvest strategy generated via the Groq API.
-- **Live market data** — prices and 90-day history pulled from Yahoo Finance (`yfinance`).
+- **Live market data** — prices stream in real time over a Finnhub websocket; the dashboard updates itself.
+- **Price history** — 90-day daily bars for charts, pulled from Yahoo Finance (`yfinance`) and cached in Redis.
 - **Dashboard** — a single-page UI with holdings, harvest table, price charts, AI summary, realized-gains log, and CSV export.
 
 ---
@@ -34,8 +37,11 @@ When you sell an investment for less than you paid, that **capital loss** can of
 ## Tech stack
 
 - **Backend:** FastAPI, SQLAlchemy, PostgreSQL
+- **Async:** Redis (broker + cache + pub/sub) and Celery
 - **Migrations:** Alembic
-- **Market data:** yfinance (Yahoo Finance)
+- **Market data:** Finnhub websocket for live prices and spot quotes; yfinance for
+  historical daily bars only (Finnhub's candle endpoints are premium). Every
+  outbound call goes through `app/prices.py`.
 - **AI:** Groq API (`openai/gpt-oss-20b`)
 - **Frontend:** vanilla HTML/JS + Chart.js (served by FastAPI)
 - **Tests:** pytest + FastAPI TestClient (in-memory SQLite)
@@ -62,7 +68,9 @@ transactions ─▶ validation ─▶ security master
 
 ## Setup
 
-**Prerequisites:** Python 3.9+, PostgreSQL running locally, and a free [Groq API key](https://console.groq.com).
+**Prerequisites:** Python 3.9+, PostgreSQL and Redis running locally, a free
+[Finnhub API key](https://finnhub.io/register), and a free
+[Groq API key](https://console.groq.com).
 
 ```bash
 # 1. Clone and enter the project
@@ -79,17 +87,35 @@ pip install -r requirements.txt
 # 4. Create the database
 createdb harvestiq
 
-# 5. Add your Groq API key
-echo "GROQ_API_KEY=your_key_here" > .env
+# 5. Add your API keys
+cat > .env <<'ENV'
+GROQ_API_KEY=your_key_here
+FINNHUB_API_KEY=your_key_here
+ENV
 
 # 6. Create the schema
 alembic upgrade head
 
-# 7. Run the server
+# 7. Run the stack (each in its own terminal)
+redis-server
+celery -A app.celery_app:celery_app worker --loglevel=info --pool=solo
 uvicorn app.main:app --reload
+python -m app.price_stream          # live Finnhub price feed
 ```
 
-Then open the dashboard at **http://127.0.0.1:8000/dashboard** and the interactive API docs at **http://127.0.0.1:8000/docs**.
+> On macOS the Celery worker must run with `--pool=solo` (fork-safety segfaults
+> otherwise).
+
+Then open the dashboard at **http://127.0.0.1:8000/dashboard** and the interactive
+API docs at **http://127.0.0.1:8000/docs**.
+
+### API conventions
+
+- Writes return **201** with the created resource; endpoints that enqueue background
+  work return **202** with a job id and a `Location` header pointing at `/jobs/{id}`.
+- Money and quantities cross the wire as **strings**, so no client can silently round
+  them through a float.
+- Errors use FastAPI's `{"detail": ...}` shape throughout.
 
 ### Load demo data (optional)
 
@@ -110,7 +136,6 @@ This creates a diversified sample portfolio (equities + crypto across several se
 | `POST /transactions` | Record a buy/sell |
 | `POST /transactions/market` | Buy/sell at the current live price |
 | `POST /securities` | Add a security to the master list |
-| `POST /refresh-prices` | Pull live prices for all securities |
 | `GET /portfolio` | Current holdings, derived from lots |
 | `GET /portfolio-summary` | Totals: value, unrealized/realized P&L, harvestable savings |
 | `GET /tax-lots` | All tax lots |
@@ -119,8 +144,12 @@ This creates a diversified sample portfolio (equities + crypto across several se
 | `GET /wash-sales` | Wash-sale flags on realized losses |
 | `GET /harvest-opportunities` | Ranked harvest candidates (accepts `short_term_rate`, `long_term_rate`) |
 | `GET /replacement-suggestions` | Wash-sale-safe alternatives |
-| `GET /harvest-explanation` | AI-written harvest summary |
-| `GET /price-history/{symbol}` | 90-day price history for charts |
+| `POST /harvest-explanations` | Enqueue an AI-written harvest summary (202 + job id) |
+| `GET /jobs/{job_id}` | Poll a background job |
+| `GET /price-history/{symbol}` | 90-day price history for charts (Redis-cached) |
+| `POST /tax-analysis/run` | Recompute the cached harvest analysis |
+| `GET /tax-analysis` | Serve the cached harvest analysis |
+| `WS /ws/prices` | Live portfolio summary pushed on each price change |
 
 ---
 
@@ -143,7 +172,11 @@ HarvestIQ is a learning project and deliberately simplifies some real-world tax 
 - **No wash-sale basis adjustment** — disallowed losses are flagged but not rolled into the replacement lot's cost basis / holding period.
 - **Simplified loss budget** — the "useful loss" figure is an approximation (realized gains + $3,000).
 - **Single-account** — wash-sale checks don't span multiple accounts (real rules include IRAs and spouses).
-- **Manual price refresh** — prices update when you click refresh, not automatically.
+- **Flat holding-period rule** — uses `days > 365` rather than the calendar
+  "more than one year" test.
+- **Per-position savings estimates** — each opportunity is valued independently,
+  so the summed "harvestable savings" figure overstates the true portfolio-level
+  benefit. Treat the ranking as sound and the total as indicative.
 
 ---
 
