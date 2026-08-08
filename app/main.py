@@ -981,6 +981,9 @@ class TaxSettingsIn(BaseModel):
     carryforward_st: Decimal = Field(ge=0, default=Decimal("0"))
     carryforward_lt: Decimal = Field(ge=0, default=Decimal("0"))
     expected_future_lt_rate: Optional[Decimal] = Field(ge=0, le=1, default=None)
+    # 0 = no gains coming (don't harvest past the current-year cap);
+    # 1 = big gain coming (bank every loss as carryforward).
+    carryforward_discount: Decimal = Field(ge=0, le=1, default=Decimal("0"))
 
 
 class TaxSettingsOut(BaseModel):
@@ -989,6 +992,7 @@ class TaxSettingsOut(BaseModel):
     carryforward_st: Money
     carryforward_lt: Money
     expected_future_lt_rate: Optional[Money] = None
+    carryforward_discount: Money = Decimal("0")
 
 
 @app.get(
@@ -1029,6 +1033,7 @@ def put_tax_settings(payload: TaxSettingsIn, db: Session = Depends(get_db)):
     settings.carryforward_st = payload.carryforward_st
     settings.carryforward_lt = payload.carryforward_lt
     settings.expected_future_lt_rate = payload.expected_future_lt_rate
+    settings.carryforward_discount = payload.carryforward_discount
     db.commit()
     db.refresh(settings)
     return settings

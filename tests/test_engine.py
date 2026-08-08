@@ -270,9 +270,13 @@ def test_plan_prices_sequentially_not_in_parallel():
     assert len(plan["steps"]) == 2
     assert float(plan["steps"][0]["step_savings"]) == pytest.approx(1400)
     assert float(plan["steps"][1]["step_savings"]) == pytest.approx(1050)
-    assert float(plan["steps"][1]["step_carryforward"]) == pytest.approx(1000)
+    # Step 2 is SIZED to the remaining $3,000 budget (a partial sell), so it
+    # generates no pointless carryforward at the default discount of 0.
+    assert plan["steps"][1]["partial"] is True
+    assert float(plan["steps"][1]["loss_harvested"]) == pytest.approx(-3000)
+    assert float(plan["steps"][1]["step_carryforward"]) == pytest.approx(0)
     assert float(plan["total_current_year_savings"]) == pytest.approx(2450)
-    assert float(plan["total_harvest_loss"]) == pytest.approx(8000)
+    assert float(plan["total_harvest_loss"]) == pytest.approx(7000)
     assert plan["stop_reason"] == "no_further_current_year_benefit"
 
     assert len(plan["carryforward_only"]) == 1
@@ -732,3 +736,101 @@ def test_two_washes_into_one_purchase_age_independently():
     assert len(replacements) == 2
     dates = sorted(l["holding_period_date"] for l in replacements)
     assert dates == ["2025-12-23", "2026-02-20"]   # 6/1 - 160d and 6/1 - 101d
+
+
+# ---------- plan sizing & carryforward pricing (review fixes 3) ----------
+def _one_thousand_st_gain():
+    add_security("GAIN", price=150)
+    buy("GAIN", 10, 50, "2026-01-05")
+    sell("GAIN", 10, 150, "2026-02-01")            # +$1,000 realized ST gain
+
+
+def test_plan_prefers_small_whole_lot_over_burning_a_big_one():
+    # $1,000 ST gain at 37%. Lot A: $4,000 loss. Lot B: $40,000 loss.
+    # Both save exactly $1,480 (gain + $3k cap). Old code tie-broke on
+    # carryforward and burned all of B. Now: take A whole, leave B alone.
+    _one_thousand_st_gain()
+    add_security("LOTA", price=60)
+    buy("LOTA", 100, 100, "2026-01-05")            # -$4,000
+    add_security("LOTB", price=100)
+    buy("LOTB", 100, 500, "2026-01-05")            # -$40,000
+
+    plan = client.get("/harvest-plan?short_term_rate=0.37&long_term_rate=0.15").json()
+    assert len(plan["steps"]) == 1
+    assert plan["steps"][0]["symbol"] == "LOTA"
+    assert plan["steps"][0]["partial"] is False
+    assert float(plan["steps"][0]["step_savings"]) == pytest.approx(1480)
+    assert [c["symbol"] for c in plan["carryforward_only"]] == ["LOTB"]
+
+
+def test_plan_partial_sell_lands_exactly_on_the_budget():
+    # Only the big lot exists: sell exactly $4,000 of it (10 of 100 shares),
+    # not the whole thing.
+    _one_thousand_st_gain()
+    add_security("LOTB", price=100)
+    buy("LOTB", 100, 500, "2026-01-05")            # -$400/share
+
+    plan = client.get("/harvest-plan?short_term_rate=0.37&long_term_rate=0.15").json()
+    step = plan["steps"][0]
+    assert step["partial"] is True
+    assert float(step["quantity_to_sell"]) == pytest.approx(10)
+    assert float(step["loss_harvested"]) == pytest.approx(-4000)
+    assert float(step["step_savings"]) == pytest.approx(1480)
+    assert float(plan["total_harvest_loss"]) == pytest.approx(4000)
+
+
+def test_bank_everything_mode_harvests_whole_lots():
+    # carryforward_discount = 1: a big gain is coming, so carryforward is
+    # priced at face value (x future rate) and the plan banks whole lots —
+    # the $40k lot now ranks FIRST because its banked value dwarfs A's.
+    client.put("/tax-settings", json={
+        "expected_future_lt_rate": "0.15", "carryforward_discount": "1",
+    })
+    _one_thousand_st_gain()
+    add_security("LOTA", price=60)
+    buy("LOTA", 100, 100, "2026-01-05")
+    add_security("LOTB", price=100)
+    buy("LOTB", 100, 500, "2026-01-05")
+
+    plan = client.get("/harvest-plan?short_term_rate=0.37&long_term_rate=0.15").json()
+    assert [s["symbol"] for s in plan["steps"]] == ["LOTB", "LOTA"]
+    assert all(s["partial"] is False for s in plan["steps"])
+    assert float(plan["total_carryforward_generated"]) == pytest.approx(40000)
+    assert plan["carryforward_only"] == []
+
+
+# ---------- spent replacement shares (review fix 4) ----------
+def test_spent_replacement_shares_dont_block_the_next_harvest():
+    # Harvest one lot; its loss is fully absorbed by a recent 10-share buy.
+    # Those shares are now spent — the second losing lot of the same symbol
+    # must NOT be flagged for a wash that can no longer happen.
+    add_security("XOM", price=60)
+    buy("XOM", 10, 100, "2026-01-05")              # lot A (will harvest)
+    buy("XOM", 10, 100, "2026-01-06")              # lot B (harvest next)
+    recent = (date.today() - timedelta(days=5)).isoformat()
+    buy("XOM", 10, 62, recent)                     # lot W: replacement shares
+
+    lots = client.get("/tax-lots").json()
+    lot_a = [l for l in lots if l["opened_date"] == "2026-01-05"][0]
+
+    # Before any wash, lot B IS at risk (W's 10 shares would remain).
+    opps = client.get("/harvest-opportunities").json()
+    lot_b_opp = [o for o in opps if o["lot_id"] != lot_a["id"] and o["symbol"] == "XOM"
+                 and float(o["unrealized_loss"]) == pytest.approx(-400)]
+    assert all(o["wash_sale_risk"] for o in lot_b_opp)
+
+    # Harvest lot A: its $400 loss soaks into W's 10 shares entirely.
+    r = client.post("/transactions", json={
+        "symbol": "XOM", "quantity": 10, "price": 60,
+        "transaction_type": "SELL", "trade_date": date.today().isoformat(),
+        "broker": "test", "fees": 0, "currency": "USD",
+        "lot_selection": "specific", "lot_ids": [lot_a["id"]],
+    })
+    assert r.status_code == 201
+
+    # W is spent: lot B is no longer falsely blocked.
+    opps = client.get("/harvest-opportunities").json()
+    lot_b_opp = [o for o in opps if o["symbol"] == "XOM"
+                 and float(o["unrealized_loss"]) == pytest.approx(-400)][0]
+    assert lot_b_opp["wash_sale_risk"] is False
+    assert lot_b_opp["recommended"] is True

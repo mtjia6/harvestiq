@@ -128,6 +128,8 @@
         <input id="cfLt" type="number" step="1" min="0" value="0">
         <label>Expected future LT rate (blank = today's)</label>
         <input id="futRate" type="number" step="0.01" min="0" max="1" placeholder="e.g. 0.15">
+        <label title="0 = no gains coming, don't harvest past this year's cap. 1 = big gain coming (property sale, RSU cliff, exit) — bank every loss as carryforward.">Carryforward value dial (0–1)</label>
+        <input id="cfDiscount" type="number" step="0.05" min="0" max="1" value="0">
         <button class="small" onclick="saveTaxSettings()">Save tax settings</button>
         <div class="saved-note" id="taxSaved"></div>
       </div>
@@ -286,15 +288,15 @@ async function loadPlan() {
       <tr>
         <td>${s.step}</td>
         <td><strong>${esc(s.symbol)}</strong>${stepBadges(s)}</td>
-        <td>${s.quantity_remaining}</td>
+        <td>${s.partial ? `${s.quantity_to_sell} <span class="muted">of ${s.quantity_remaining}</span>` : s.quantity_to_sell}</td>
         <td>${s.term}</td>
-        <td class="red">${money(s.unrealized_loss)}</td>
+        <td class="red">${money(s.loss_harvested)}</td>
         <td class="green">${money(s.step_savings)}</td>
         <td class="red">${money(s.step_future_tax_cost)}</td>
         <td class="${cls(s.step_net_benefit)}">${money(s.step_net_benefit)}</td>
         <td class="green">${money(s.cumulative_savings)}</td>
         <td>${s.lot_broker
-              ? `<button class="small" onclick="executeStep(this)" data-lot="${s.lot_id}" data-symbol="${esc(s.symbol)}" data-qty="${s.quantity_remaining}" data-broker="${esc(s.lot_broker)}">Sell lot #${s.lot_id}</button>`
+              ? `<button class="small" onclick="executeStep(this)" data-lot="${s.lot_id}" data-symbol="${esc(s.symbol)}" data-qty="${s.quantity_to_sell}" data-broker="${esc(s.lot_broker)}">Sell${s.partial ? ' part of' : ''} lot #${s.lot_id}</button>`
               : '<span class="muted" title="This lot has no broker recorded, so a specific-lot sell cannot be routed.">no broker</span>'}</td>
       </tr>`).join('');
     area.innerHTML = `
@@ -454,6 +456,7 @@ async function loadTaxSettings() {
   document.getElementById('cfSt').value = Number(s.carryforward_st) || 0;
   document.getElementById('cfLt').value = Number(s.carryforward_lt) || 0;
   document.getElementById('futRate').value = s.expected_future_lt_rate ?? '';
+  document.getElementById('cfDiscount').value = Number(s.carryforward_discount) || 0;
 }
 
 async function saveTaxSettings() {
@@ -465,6 +468,7 @@ async function saveTaxSettings() {
       carryforward_st: document.getElementById('cfSt').value || '0',
       carryforward_lt: document.getElementById('cfLt').value || '0',
       expected_future_lt_rate: fut === '' ? null : fut,
+      carryforward_discount: document.getElementById('cfDiscount').value || '0',
     }),
   });
   if (res.ok) { flash('taxSaved', 'Saved — recomputing…'); recomputeTax(); }

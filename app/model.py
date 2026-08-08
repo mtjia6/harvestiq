@@ -161,3 +161,13 @@ class TaxSettingsDB(Base):
     expected_future_lt_rate: Mapped[Optional[decimal.Decimal]] = mapped_column(
         Numeric(6, 4), nullable=True
     )
+    # How much a dollar of NEW carryforward is worth to this user, as a
+    # fraction of its face value at the future rate (0..1). This is the
+    # explicit strategic dial the plan uses instead of silently assuming:
+    #   0 = no gains on the horizon — don't spend scarce unrealized loss
+    #       past the current-year cap (plan sells partial lots to land on it)
+    #   1 = a large gain is coming (property sale, RSU cliff, exit) — bank
+    #       every loss now; carryforward is near face value
+    carryforward_discount: Mapped[decimal.Decimal] = mapped_column(
+        Numeric(6, 4), default=decimal.Decimal("0")
+    )

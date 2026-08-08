@@ -150,6 +150,16 @@ def get_expected_future_rate(db, fallback_long_rate):
     return settings.expected_future_lt_rate
 
 
+def get_carryforward_discount(db):
+    """User's price on a dollar of NEW carryforward, as a fraction of its
+    future-rate face value (0..1). 0 = no gains coming, don't harvest past
+    the current-year cap; 1 = big gain coming, bank everything."""
+    settings = db.query(TaxSettingsDB).first()
+    if settings is None or settings.carryforward_discount is None:
+        return Decimal("0")
+    return settings.carryforward_discount
+
+
 def deferral_math(loss_amount, current_year_savings, carryforward_generated, future_rate):
     """The honest three numbers for one harvested loss of size L:
 
@@ -207,16 +217,17 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
     net_st, net_lt = get_effective_net_position(db)
     future_rate = get_expected_future_rate(db, long_term_rate)
 
-    # ONE query for every symbol's window buys (kills the old per-lot N+1).
+    # ONE pass for every symbol's window purchases (no per-lot N+1). Sourced
+    # from LOTS, not transactions, because only shares you'd actually still
+    # hold can be replacements: shares already sold are gone
+    # (quantity_remaining) and shares that already absorbed a disallowed
+    # loss are spent (wash_replacement_used) — a share blocks at most one
+    # harvest, never two.
     window_start = today - timedelta(days=WASH_SALE_WINDOW_DAYS)
-    window_buys_by_symbol = {}
-    for tx in (
-        db.query(TransactionDB)
-        .filter(TransactionDB.transaction_type == "BUY")
-        .filter(TransactionDB.trade_date >= window_start)
-        .all()
-    ):
-        window_buys_by_symbol.setdefault(tx.symbol, []).append(tx)
+    window_lots_by_symbol = {}
+    for wlot in open_lots:
+        if wlot.opened_date >= window_start:
+            window_lots_by_symbol.setdefault(wlot.symbol, []).append(wlot)
 
     # Purchases observed in watch-only EXTERNAL accounts count too — the
     # wash-sale rule applies to the taxpayer across all accounts, while each
@@ -264,12 +275,18 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
             # is "washed" — the old any-recent-buy check wrongly vetoed
             # exactly those sharp fresh-drawdown lots, a harvester's best
             # candidates.
-            window_buys = window_buys_by_symbol.get(lot.symbol, [])
-            window_buy_qty = sum((tx.quantity for tx in window_buys), Decimal("0"))
-            own_window_qty = (
-                lot.quantity_remaining if lot.opened_date >= window_start else Decimal("0")
-            )
-            internal_replacement = window_buy_qty - own_window_qty
+            # Internal replacement shares: window lots OTHER than the one
+            # being sold (selling this lot removes its own shares from the
+            # pool), net of shares already spent on a previous wash.
+            window_lots = [
+                w for w in window_lots_by_symbol.get(lot.symbol, []) if w.id != lot.id
+            ]
+            internal_sources = [
+                (w, w.quantity_remaining - w.wash_replacement_used)
+                for w in window_lots
+                if w.quantity_remaining - w.wash_replacement_used > 0
+            ]
+            internal_replacement = sum((q for _, q in internal_sources), Decimal("0"))
 
             external_buys = external_window_by_symbol.get(lot.symbol, [])
             external_replacement = sum(
@@ -287,7 +304,7 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
             if wash_sale_risk:
                 reasons = []
                 if internal_replacement > 0:
-                    buy_dates = ", ".join(str(tx.trade_date) for tx in window_buys)
+                    buy_dates = ", ".join(str(w.opened_date) for w, _ in internal_sources)
                     reasons.append(
                         f"{internal_replacement.normalize()} shares bought within the last "
                         f"{WASH_SALE_WINDOW_DAYS} days (on {buy_dates}) would remain after this sale"
@@ -602,18 +619,30 @@ def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Dec
       3. apply its loss to the running position, and repeat.
 
     Re-pricing each round matters: once ST gains are exhausted, a short-term
-    loss that ranked first can fall behind a long-term one. Greedy is exact
-    enough here because marginal value is non-increasing (gains at full rate
-    -> the $3,000 ordinary cap -> zero), i.e. diminishing returns.
+    loss that ranked first can fall behind a long-term one.
 
-    Stops when the best remaining lot saves <= `min_step_savings` this year.
-    Lots past that line are reported as `carryforward_only` — a legitimate,
-    deliberate choice (banking losses), never advertised as savings. Lots
-    with wash-sale risk are excluded from the plan and listed separately.
+    Ranking is a SINGLE explicit score per candidate:
+
+        score = current_year_savings + (future_rate x carryforward_discount)
+                                        x carryforward_generated
+
+    carryforward_discount is the user's strategic dial (see tax_settings):
+    at 0 the plan refuses to spend unrealized loss past the current-year
+    cap — candidates are SIZED to the remaining useful-loss budget, so the
+    right answer to "a $40k-loss lot when only $4k still does anything" is
+    a partial sell of exactly $4k, never the whole lot. At 1 (big gain
+    coming), carryforward is priced near face value and the plan banks
+    whole lots. Ties prefer spending less unrealized loss, then whole-lot
+    sells over partial ones (simpler to execute).
+
+    Stops when the best remaining score <= `min_step_savings`. Lots past
+    that line are `carryforward_only` — a deliberate deferral choice,
+    never advertised as savings. Wash-risky lots are excluded and listed.
     """
     candidates = build_harvest_opportunities(db, short_term_rate, long_term_rate)
     net_st, net_lt = get_effective_net_position(db)
     future_rate = get_expected_future_rate(db, long_term_rate)
+    carryforward_price = future_rate * get_carryforward_discount(db)
 
     remaining = [o for o in candidates if o["recommended"]]
     excluded_wash_sale = [
@@ -625,42 +654,69 @@ def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Dec
     steps = []
     cumulative_savings = Decimal("0")
     cumulative_carryforward = Decimal("0")
+    total_harvest_loss = Decimal("0")
     stop_reason = "exhausted_candidates"
 
     while remaining:
-        best = None
-        best_value = None
-        for o in remaining:
-            loss = -Decimal(str(o["unrealized_loss"]))
-            value = marginal_harvest_value(
-                loss, o["term"], net_st, net_lt, short_term_rate, long_term_rate
-            )
-            if best is None or value > best_value:
-                best, best_value = o, value
+        # How much MORE loss still produces any current-year benefit from
+        # the running position (same identity as useful_loss_budget).
+        budget = max(net_st + net_lt + ANNUAL_ORDINARY_LOSS_LIMIT, Decimal("0"))
 
-        step_savings, step_carryforward = best_value
-        if step_savings <= min_step_savings:
+        best = None
+        best_key = None
+        best_calc = None
+        for o in remaining:
+            full_loss = -Decimal(str(o["unrealized_loss"]))
+            # Size the harvest: with carryforward priced at zero, selling
+            # beyond the budget spends scarce unrealized loss for nothing.
+            sized_loss = full_loss if carryforward_price > 0 else min(full_loss, budget)
+            if sized_loss <= 0:
+                continue
+            savings, carry = marginal_harvest_value(
+                sized_loss, o["term"], net_st, net_lt, short_term_rate, long_term_rate
+            )
+            score = savings + carryforward_price * carry
+            key = (score, -sized_loss, 1 if sized_loss == full_loss else 0)
+            if best is None or key > best_key:
+                best, best_key, best_calc = o, key, (sized_loss, savings, carry, score)
+
+        if best is None:
+            stop_reason = "no_further_current_year_benefit"
+            break
+        sized_loss, step_savings, step_carryforward, score = best_calc
+        if score <= min_step_savings:
             stop_reason = "no_further_current_year_benefit"
             break
 
-        loss = -Decimal(str(best["unrealized_loss"]))
         if best["term"] == "long":
-            net_lt -= loss
+            net_lt -= sized_loss
         else:
-            net_st -= loss
+            net_st -= sized_loss
 
-        step_deferral = deferral_math(loss, step_savings, step_carryforward, future_rate)
+        full_loss = -Decimal(str(best["unrealized_loss"]))
+        lot_quantity = Decimal(str(best["quantity_remaining"]))
+        partial = sized_loss < full_loss
+        quantity_to_sell = (
+            (lot_quantity * sized_loss / full_loss).quantize(Decimal("0.00000001"))
+            if partial else lot_quantity
+        )
+
+        step_deferral = deferral_math(sized_loss, step_savings, step_carryforward, future_rate)
         cumulative_savings += step_savings
         cumulative_carryforward += step_carryforward
+        total_harvest_loss += sized_loss
         steps.append({
             "step": len(steps) + 1,
             "lot_id": best["lot_id"],
             "symbol": best["symbol"],
             "asset_class": best["asset_class"],
             "quantity_remaining": best["quantity_remaining"],
+            "quantity_to_sell": quantity_to_sell,
+            "partial": partial,
             "lot_broker": best["lot_broker"],
             "term": best["term"],
             "unrealized_loss": best["unrealized_loss"],
+            "loss_harvested": -sized_loss,
             "drip_risk": best["drip_risk"],
             "drip_warning": best["drip_warning"],
             "step_savings": step_savings,
@@ -688,9 +744,6 @@ def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Dec
             "carryforward_if_harvested": carry,
         })
 
-    total_harvest_loss = sum(
-        (-Decimal(str(s["unrealized_loss"])) for s in steps), Decimal("0")
-    )
     total_deferral = deferral_math(
         total_harvest_loss, cumulative_savings, cumulative_carryforward, future_rate
     )
