@@ -506,3 +506,96 @@ def test_no_drip_warning_when_off_or_dividend_far_away():
     vti = [o for o in client.get("/harvest-opportunities").json() if o["symbol"] == "VTI"][0]
     assert vti["drip_risk"] is False
     assert vti["drip_warning"] is None
+
+
+# ---------- watch-only external accounts (cross-account wash sales) ----------
+def add_external_account(name="Fidelity Roth IRA", account_type="roth_ira"):
+    r = client.post("/external-accounts", json={
+        "name": name, "broker": "fidelity", "account_type": account_type,
+    })
+    return r.json()["id"]
+
+
+def external_buy(account_id, symbol, qty, trade_date):
+    return client.post(f"/external-accounts/{account_id}/activities", json={
+        "symbol": symbol, "quantity": qty, "trade_date": trade_date,
+    })
+
+
+def test_external_ira_buy_flags_harvest_as_permanent_wash_risk():
+    add_security("VOO", price=400)
+    buy("VOO", 10, 500, "2026-01-05")              # losing lot, old, no internal wash
+    ira = add_external_account()
+    recent = (date.today() - timedelta(days=7)).isoformat()
+    assert external_buy(ira, "VOO", 5, recent).status_code == 201
+
+    opps = client.get("/harvest-opportunities").json()
+    voo = [o for o in opps if o["symbol"] == "VOO"][0]
+    assert voo["wash_sale_risk"] is True
+    assert voo["wash_sale_permanent"] is True
+    assert "Fidelity Roth IRA" in voo["wash_sale_reason"]
+    assert "PERMANENTLY" in voo["wash_sale_reason"]
+    assert voo["recommended"] is False
+
+
+def test_sell_washed_by_external_ira_buy_notes_permanent_destruction():
+    add_security("VOO")
+    buy("VOO", 10, 500, "2026-01-05")
+    ira = add_external_account()
+    external_buy(ira, "VOO", 10, "2026-02-25")     # IRA buys inside the window
+    sell("VOO", 10, 400, "2026-03-01")             # $1,000 economic loss
+
+    gains = client.get("/realized-gains").json()
+    assert float(gains[0]["gain_loss"]) == pytest.approx(0)          # fully washed
+    assert float(gains[0]["disallowed_wash_loss"]) == pytest.approx(1000)
+    assert "PERMANENTLY destroyed" in gains[0]["wash_sale_note"]
+    assert "Rev. Rul. 2008-5" in gains[0]["wash_sale_note"]
+
+
+def test_external_buy_recorded_later_retroactively_washes_loss():
+    # The classic: harvest first, IRA auto-buys the fund a week later.
+    add_security("VOO")
+    buy("VOO", 10, 500, "2026-01-05")
+    sell("VOO", 10, 400, "2026-03-01")             # clean $1,000 loss... for now
+    gains = client.get("/realized-gains").json()
+    assert float(gains[0]["gain_loss"]) == pytest.approx(-1000)
+
+    ira = add_external_account()
+    external_buy(ira, "VOO", 10, "2026-03-08")     # recorded after the fact
+
+    gains = client.get("/realized-gains").json()
+    assert float(gains[0]["gain_loss"]) == pytest.approx(0)
+    assert float(gains[0]["disallowed_wash_loss"]) == pytest.approx(1000)
+
+
+def test_external_taxable_buy_partial_disallowance_and_note():
+    # Only 4 replacement shares exist externally -> 4/10 of the loss washes;
+    # a taxable external account defers (doesn't destroy) the loss.
+    add_security("VOO")
+    buy("VOO", 10, 500, "2026-01-05")
+    ext = add_external_account(name="Spouse Schwab", account_type="taxable")
+    external_buy(ext, "VOO", 4, "2026-02-25")
+    sell("VOO", 10, 400, "2026-03-01")             # $100/share loss
+
+    gains = client.get("/realized-gains").json()
+    assert float(gains[0]["disallowed_wash_loss"]) == pytest.approx(400)
+    assert float(gains[0]["gain_loss"]) == pytest.approx(-600)
+    assert "Spouse Schwab" in gains[0]["wash_sale_note"]
+    assert "PERMANENTLY" not in gains[0]["wash_sale_note"]
+
+
+def test_one_external_buy_cannot_wash_two_sales():
+    # replacement_used: 5 external shares absorb one sale's loss and are
+    # then spent — a second harvest isn't washed by the same purchase.
+    add_security("VOO")
+    buy("VOO", 5, 500, "2026-01-05")
+    buy("VOO", 5, 500, "2026-01-06")
+    ext = add_external_account(name="Spouse Schwab", account_type="taxable")
+    external_buy(ext, "VOO", 5, "2026-02-25")
+    sell("VOO", 5, 400, "2026-03-01")              # washed by the 5 ext shares
+    sell("VOO", 5, 400, "2026-03-02")              # nothing left to wash it
+
+    gains = sorted(client.get("/realized-gains").json(), key=lambda g: g["sell_date"])
+    assert float(gains[0]["disallowed_wash_loss"]) == pytest.approx(500)
+    assert float(gains[1]["disallowed_wash_loss"]) == pytest.approx(0)
+    assert float(gains[1]["gain_loss"]) == pytest.approx(-500)

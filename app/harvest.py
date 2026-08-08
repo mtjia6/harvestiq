@@ -1,5 +1,14 @@
 from datetime import date, timedelta
-from app.model import SecurityDB, TaxLotDB, TransactionDB, RealizedGainDB, TaxSettingsDB
+from app.model import (
+    SecurityDB,
+    TaxLotDB,
+    TransactionDB,
+    RealizedGainDB,
+    TaxSettingsDB,
+    ExternalAccountDB,
+    ExternalActivityDB,
+    RETIREMENT_ACCOUNT_TYPES,
+)
 from decimal import Decimal
 
 # The IRS caps the net capital loss deductible against ordinary income at
@@ -168,6 +177,19 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
     ):
         window_buys_by_symbol.setdefault(tx.symbol, []).append(tx)
 
+    # Purchases observed in watch-only EXTERNAL accounts count too — the
+    # wash-sale rule applies to the taxpayer across all accounts, while each
+    # broker only sees its own. This is the cross-account blind spot nothing
+    # mainstream covers.
+    external_window_by_symbol = {}
+    for activity, account in (
+        db.query(ExternalActivityDB, ExternalAccountDB)
+        .join(ExternalAccountDB, ExternalActivityDB.account_id == ExternalAccountDB.id)
+        .filter(ExternalActivityDB.trade_date >= window_start)
+        .all()
+    ):
+        external_window_by_symbol.setdefault(activity.symbol, []).append((activity, account))
+
     for lot in open_lots:
         security = securities_by_symbol.get(lot.symbol)
         if security is None or security.latest_price is None:
@@ -203,21 +225,52 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
             own_window_qty = (
                 lot.quantity_remaining if lot.opened_date >= window_start else Decimal("0")
             )
-            replacement_qty = window_buy_qty - own_window_qty
+            internal_replacement = window_buy_qty - own_window_qty
 
+            external_buys = external_window_by_symbol.get(lot.symbol, [])
+            external_replacement = sum(
+                (a.quantity - a.replacement_used for a, _ in external_buys), Decimal("0")
+            )
+            retirement_buys = [
+                (a, acct) for a, acct in external_buys
+                if acct.account_type in RETIREMENT_ACCOUNT_TYPES
+            ]
+
+            replacement_qty = internal_replacement + external_replacement
             wash_sale_risk = replacement_qty > 0
+            wash_sale_permanent = len(retirement_buys) > 0
+
             if wash_sale_risk:
-                buy_dates = ", ".join(str(tx.trade_date) for tx in window_buys)
+                reasons = []
+                if internal_replacement > 0:
+                    buy_dates = ", ".join(str(tx.trade_date) for tx in window_buys)
+                    reasons.append(
+                        f"{internal_replacement.normalize()} shares bought within the last "
+                        f"{WASH_SALE_WINDOW_DAYS} days (on {buy_dates}) would remain after this sale"
+                    )
+                for a, acct in external_buys:
+                    if a.quantity - a.replacement_used <= 0:
+                        continue
+                    reasons.append(
+                        f"{(a.quantity - a.replacement_used).normalize()} shares bought in "
+                        f"external account '{acct.name}' on {a.trade_date}"
+                    )
                 wash_sale_reason = (
-                    f"{replacement_qty.normalize()} shares of {lot.symbol} bought within the last "
-                    f"{WASH_SALE_WINDOW_DAYS} days (on {buy_dates}) would remain after this sale, "
-                    f"so the loss would be disallowed against them"
+                    f"the loss on {lot.symbol} would be disallowed: " + "; ".join(reasons)
                 )
+                if wash_sale_permanent:
+                    wash_sale_reason += (
+                        " — WARNING: the retirement-account purchase would PERMANENTLY "
+                        "destroy the loss, not just defer it (Rev. Rul. 2008-5)"
+                    )
             else:
                 wash_sale_reason = None
             # Selling today starts the forward half of the window: a rebuy on
             # or before this date disallows the harvested loss.
             safe_to_rebuy_after = today + timedelta(days=WASH_SALE_WINDOW_DAYS)
+
+        if security.asset_class == "crypto":
+            wash_sale_permanent = False
 
         # DRIP guard: an automatic dividend reinvestment is a BUY the
         # wash-sale rule counts, and the engine can't stop the broker from
@@ -265,6 +318,7 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
             "carryforward_generated": carryforward_generated,
             "wash_sale_risk": wash_sale_risk,
             "wash_sale_reason": wash_sale_reason,
+            "wash_sale_permanent": wash_sale_permanent,
             "safe_to_rebuy_after": safe_to_rebuy_after,
             "drip_risk": drip_risk,
             "drip_warning": drip_warning,
@@ -363,6 +417,92 @@ def apply_wash_sale_on_buy(db, symbol, new_lot, buy_date):
     )
     for realized in losses:
         _transfer_disallowed_loss(db, realized, new_lot, realized.sell_date)
+
+
+def _disallow_against_external(db, realized, activity, account):
+    """Disallow part of a realized loss against a purchase in a watch-only
+    external account. Unlike the internal case there is no lot of ours to
+    roll the basis into:
+
+      - taxable external account: the basis adjustment legally belongs to
+        that account's books — we record the disallowance and say where it
+        went so the user can reconcile.
+      - retirement account (Rev. Rul. 2008-5): the loss is PERMANENTLY
+        destroyed — no basis adjustment anywhere, ever. The worst outcome
+        in tax-loss harvesting, and exactly what an auto-investing IRA does
+        to a taxable harvest without anyone noticing.
+    """
+    economic_loss = realized.cost_basis - realized.proceeds  # positive = loss
+    remaining = economic_loss - realized.disallowed_wash_loss
+    capacity = activity.quantity - activity.replacement_used
+    if remaining <= 0 or capacity <= 0:
+        return Decimal("0")
+
+    per_share_loss = economic_loss / realized.quantity_sold
+    shares = min(remaining / per_share_loss, capacity)
+    amount = shares * per_share_loss
+
+    realized.disallowed_wash_loss += amount
+    realized.gain_loss += amount
+    activity.replacement_used += shares
+
+    if account.account_type in RETIREMENT_ACCOUNT_TYPES:
+        note = (
+            f"${amount} of this loss was PERMANENTLY destroyed — replacement purchase "
+            f"of {shares.normalize()} shares in retirement account '{account.name}' on "
+            f"{activity.trade_date} (Rev. Rul. 2008-5: no basis adjustment in a "
+            f"tax-advantaged account)"
+        )
+    else:
+        note = (
+            f"${amount} of this loss was disallowed — replacement purchase of "
+            f"{shares.normalize()} shares in external account '{account.name}' on "
+            f"{activity.trade_date}; the basis adjustment belongs to that account's books"
+        )
+    realized.wash_sale_note = (
+        note if realized.wash_sale_note is None else realized.wash_sale_note + "; " + note
+    )
+    return amount
+
+
+def apply_external_wash_on_sell(db, symbol, sell_date, realized_records):
+    """After a SELL: purchases in watch-only accounts inside the ±30-day
+    window wash the loss exactly like our own purchases would."""
+    window_start = sell_date - timedelta(days=WASH_SALE_WINDOW_DAYS)
+    window_end = sell_date + timedelta(days=WASH_SALE_WINDOW_DAYS)
+    external = (
+        db.query(ExternalActivityDB, ExternalAccountDB)
+        .join(ExternalAccountDB, ExternalActivityDB.account_id == ExternalAccountDB.id)
+        .filter(ExternalActivityDB.symbol == symbol)
+        .filter(ExternalActivityDB.trade_date >= window_start)
+        .filter(ExternalActivityDB.trade_date <= window_end)
+        .order_by(ExternalActivityDB.trade_date)
+        .all()
+    )
+    for realized in realized_records:
+        if realized.cost_basis <= realized.proceeds:
+            continue
+        for activity, account in external:
+            _disallow_against_external(db, realized, activity, account)
+
+
+def apply_external_wash_on_activity(db, activity, account):
+    """When an external BUY is recorded: retroactively wash any loss we
+    realized within 30 days of it — the 'my IRA auto-bought the fund the
+    week after I harvested' case, discovered months later on a tax form."""
+    window_start = activity.trade_date - timedelta(days=WASH_SALE_WINDOW_DAYS)
+    window_end = activity.trade_date + timedelta(days=WASH_SALE_WINDOW_DAYS)
+    losses = (
+        db.query(RealizedGainDB)
+        .filter(RealizedGainDB.symbol == activity.symbol)
+        .filter(RealizedGainDB.sell_date >= window_start)
+        .filter(RealizedGainDB.sell_date <= window_end)
+        .filter(RealizedGainDB.cost_basis > RealizedGainDB.proceeds)
+        .order_by(RealizedGainDB.sell_date)
+        .all()
+    )
+    for realized in losses:
+        _disallow_against_external(db, realized, activity, account)
 
 
 def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Decimal("0")):

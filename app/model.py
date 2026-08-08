@@ -82,8 +82,57 @@ class RealizedGainDB(Base):
     disallowed_wash_loss: Mapped[decimal.Decimal] = mapped_column(
         Numeric(20, 8), default=decimal.Decimal("0")
     )
+    # Where a disallowed loss went: internal replacement lots carry it in
+    # their adjusted basis, but a loss washed by an EXTERNAL account purchase
+    # either belongs to that account's books (taxable) or is permanently
+    # destroyed (retirement). This note says which, in plain English.
+    wash_sale_note: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     term: Mapped[str] = mapped_column(String)
     sell_date: Mapped[datetime.date] = mapped_column(Date)
+
+
+# Account types where a wash-sale replacement purchase PERMANENTLY destroys
+# the loss (Rev. Rul. 2008-5): there is no basis to adjust in a tax-advantaged
+# account, so the disallowed loss can never come back.
+RETIREMENT_ACCOUNT_TYPES = {"traditional_ira", "roth_ira", "401k", "hsa"}
+
+
+class ExternalAccountDB(Base):
+    """A watch-only account at another broker (or a retirement account).
+
+    HarvestIQ never suggests selling from these — they exist so purchases
+    made in them can be counted against the wash-sale rule, which applies
+    to the TAXPAYER across all accounts while each broker only sees its own.
+    """
+    __tablename__ = "external_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String)          # "Fidelity Roth IRA"
+    broker: Mapped[str] = mapped_column(String)
+    account_type: Mapped[str] = mapped_column(String)  # taxable / traditional_ira / roth_ira / 401k / hsa / other
+
+    @property
+    def is_retirement(self) -> bool:
+        return self.account_type in RETIREMENT_ACCOUNT_TYPES
+
+
+class ExternalActivityDB(Base):
+    """A purchase observed in a watch-only account (manual entry for now).
+
+    Only BUYs matter to the wash-sale rule. `replacement_used` tracks how
+    many of these shares have already absorbed a disallowed loss, so the
+    same external purchase can't wash two different sales.
+    """
+    __tablename__ = "external_activities"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("external_accounts.id"))
+    symbol: Mapped[str] = mapped_column(String)
+    quantity: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
+    trade_date: Mapped[datetime.date] = mapped_column(Date)
+    replacement_used: Mapped[decimal.Decimal] = mapped_column(
+        Numeric(20, 8), default=decimal.Decimal("0")
+    )
 
 
 class TaxSettingsDB(Base):

@@ -24,7 +24,15 @@ from starlette.concurrency import run_in_threadpool
 import redis.asyncio as aioredis
 
 from app.database import get_db, SessionLocal
-from app.model import TransactionDB, SecurityDB, TaxLotDB, RealizedGainDB, TaxSettingsDB
+from app.model import (
+    TransactionDB,
+    SecurityDB,
+    TaxLotDB,
+    RealizedGainDB,
+    TaxSettingsDB,
+    ExternalAccountDB,
+    ExternalActivityDB,
+)
 from app.celery_app import celery_app, redis_client, generate_harvest_explanation, run_tax_analysis
 from app.harvest import (
     build_harvest_opportunities,
@@ -34,6 +42,8 @@ from app.harvest import (
     holding_term,
     apply_wash_sale_on_sell,
     apply_wash_sale_on_buy,
+    apply_external_wash_on_sell,
+    apply_external_wash_on_activity,
 )
 from app import prices
 from app.prices import PriceUnavailable
@@ -242,6 +252,7 @@ class RealizedGainOut(BaseModel):
     cost_basis: Money
     gain_loss: Money
     disallowed_wash_loss: Money
+    wash_sale_note: Optional[str] = None
     term: str
     sell_date: date
 
@@ -457,6 +468,12 @@ def process_transaction(transaction: Transaction, db: Session):
         if security.asset_class != "crypto":
             db.flush()
             apply_wash_sale_on_sell(
+                db, transaction.symbol, transaction.trade_date, realized_records
+            )
+            # Cross-account: purchases in watch-only external accounts wash
+            # the loss too (internal replacements get first claim so the
+            # deferred basis stays on our books where possible).
+            apply_external_wash_on_sell(
                 db, transaction.symbol, transaction.trade_date, realized_records
             )
 
@@ -814,6 +831,143 @@ def get_wash_sales(db: Session = Depends(get_db)):
         })
 
     return results
+
+
+class ExternalAccountIn(BaseModel):
+    name: str = Field(min_length=1)
+    broker: str = Field(min_length=1)
+    account_type: Literal[
+        "taxable", "traditional_ira", "roth_ira", "401k", "hsa", "other"
+    ]
+
+
+class ExternalAccountOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    broker: str
+    account_type: str
+    is_retirement: bool
+
+
+class ExternalActivityIn(BaseModel):
+    symbol: str = Field(min_length=1)
+    quantity: Decimal = Field(gt=0)
+    trade_date: date
+
+
+class ExternalActivityOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    account_id: int
+    symbol: str
+    quantity: Money
+    trade_date: date
+    replacement_used: Money
+
+
+@app.post(
+    "/external-accounts",
+    tags=["External accounts"],
+    status_code=status.HTTP_201_CREATED,
+    response_model=ExternalAccountOut,
+    summary="Add a watch-only account",
+    description=(
+        "The wash-sale rule applies to you across ALL your accounts, but "
+        "every broker only sees its own. Register other accounts here as "
+        "watch-only: HarvestIQ never suggests selling from them — it only "
+        "counts their purchases against the ±30-day wash window. A "
+        "retirement-account purchase destroys a harvested loss PERMANENTLY "
+        "(Rev. Rul. 2008-5), so declaring IRAs/401(k)s matters most."
+    ),
+)
+def create_external_account(payload: ExternalAccountIn, db: Session = Depends(get_db)):
+    account = ExternalAccountDB(
+        name=payload.name, broker=payload.broker, account_type=payload.account_type
+    )
+    db.add(account)
+    db.commit()
+    db.refresh(account)
+    return account
+
+
+@app.get(
+    "/external-accounts",
+    tags=["External accounts"],
+    response_model=List[ExternalAccountOut],
+    summary="List watch-only accounts",
+)
+def get_external_accounts(db: Session = Depends(get_db)):
+    return db.query(ExternalAccountDB).all()
+
+
+@app.post(
+    "/external-accounts/{account_id}/activities",
+    tags=["External accounts"],
+    status_code=status.HTTP_201_CREATED,
+    response_model=ExternalActivityOut,
+    summary="Record a purchase observed in a watch-only account",
+    description=(
+        "Recording a BUY here immediately re-checks recent realized losses: "
+        "if this purchase lands inside the ±30-day window of a loss we "
+        "realized, that loss is retroactively disallowed (the 'my IRA "
+        "auto-bought the fund a week after I harvested' case). Re-run "
+        "`POST /tax-analysis/run` afterwards."
+    ),
+    responses={404: {"description": "Unknown account or symbol."}},
+)
+def create_external_activity(
+    account_id: int, payload: ExternalActivityIn, db: Session = Depends(get_db)
+):
+    account = (
+        db.query(ExternalAccountDB)
+        .filter(ExternalAccountDB.id == account_id)
+        .first()
+    )
+    if account is None:
+        raise HTTPException(status_code=404, detail=f"Unknown external account: {account_id}")
+
+    security = (
+        db.query(SecurityDB)
+        .filter(SecurityDB.symbol == payload.symbol)
+        .first()
+    )
+    if security is None:
+        raise HTTPException(status_code=404, detail=f"Unknown symbol: {payload.symbol}")
+
+    activity = ExternalActivityDB(
+        account_id=account_id,
+        symbol=payload.symbol,
+        quantity=payload.quantity,
+        trade_date=payload.trade_date,
+        replacement_used=Decimal("0"),
+    )
+    db.add(activity)
+    db.flush()
+
+    # Retroactive cross-account wash check (crypto is exempt: property).
+    if security.asset_class != "crypto":
+        apply_external_wash_on_activity(db, activity, account)
+
+    db.commit()
+    db.refresh(activity)
+    return activity
+
+
+@app.get(
+    "/external-accounts/{account_id}/activities",
+    tags=["External accounts"],
+    response_model=List[ExternalActivityOut],
+    summary="List observed activity in a watch-only account",
+)
+def get_external_activities(account_id: int, db: Session = Depends(get_db)):
+    return (
+        db.query(ExternalActivityDB)
+        .filter(ExternalActivityDB.account_id == account_id)
+        .all()
+    )
 
 
 class TaxSettingsIn(BaseModel):
