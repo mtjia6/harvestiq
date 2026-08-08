@@ -709,9 +709,11 @@ def build_portfolio_summary(db, opportunities, plan=None):
     # actually yields. Summing the per-lot figures (the fallback) overstates —
     # each lot is priced against the same starting position, and the numbers
     # don't survive each other's execution.
+    harvestable_net = None
     if plan is not None:
         harvestable_savings = Decimal(str(plan["total_current_year_savings"]))
         harvestable_loss = Decimal(str(plan["total_harvest_loss"]))
+        harvestable_net = Decimal(str(plan["total_net_benefit"]))
     else:
         rec = [o for o in opportunities if o["recommended"]]
         harvestable_savings = sum((Decimal(str(o["estimated_tax_savings"])) for o in rec), Decimal("0"))
@@ -737,6 +739,7 @@ def build_portfolio_summary(db, opportunities, plan=None):
         "effective_net_total": effective_total,
         "harvestable_recommended_loss": harvestable_loss,
         "harvestable_recommended_savings": harvestable_savings,
+        "harvestable_net_benefit": harvestable_net,  # None until a plan is cached
         "useful_loss_budget": useful_loss_budget,
     }
 

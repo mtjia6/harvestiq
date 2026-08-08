@@ -6,7 +6,7 @@
 <title>HarvestIQ</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
-  :root { --bg:#0f172a; --card:#1e293b; --card2:#172033; --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --green:#4ade80; --red:#f87171; --border:#334155; }
+  :root { --bg:#0f172a; --card:#1e293b; --card2:#172033; --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --green:#4ade80; --red:#f87171; --amber:#fbbf24; --border:#334155; }
   * { box-sizing:border-box; }
   body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); }
   header { padding:20px 32px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; }
@@ -15,28 +15,44 @@
   main { padding:24px 32px; max-width:1100px; margin:0 auto; }
   .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px; margin-bottom:24px; }
   h2 { margin:0 0 12px; font-size:16px; }
+  h3 { margin:0 0 10px; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
   .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:16px; }
   .stat { background:var(--card2); border:1px solid var(--border); border-radius:10px; padding:16px; }
   .stat .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
   .stat .value { font-size:24px; font-weight:700; margin-top:6px; }
+  .stat .subvalue { font-size:12px; color:var(--muted); margin-top:4px; }
   .controls { display:flex; gap:16px; align-items:flex-end; flex-wrap:wrap; }
   label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
   input, select { background:var(--bg); border:1px solid var(--border); color:var(--text); border-radius:8px; padding:8px 10px; }
   input { width:120px; }
   button { background:var(--accent); color:#04263a; border:none; border-radius:8px; padding:9px 16px; font-weight:600; cursor:pointer; }
   button.secondary { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  button.small { padding:5px 10px; font-size:12px; }
+  button.danger-armed { background:var(--red); color:#fff; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
   table { width:100%; border-collapse:collapse; margin-top:8px; }
   th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); font-size:14px; }
   th { color:var(--muted); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
-  .green { color:var(--green); } .red { color:var(--red); }
-  .badge { font-size:11px; padding:2px 8px; border-radius:99px; }
+  .green { color:var(--green); } .red { color:var(--red); } .amber { color:var(--amber); }
+  .badge { font-size:11px; padding:2px 8px; border-radius:99px; white-space:nowrap; }
   .badge.ok { background:rgba(74,222,128,.15); color:var(--green); }
   .badge.warn { background:rgba(248,113,113,.15); color:var(--red); }
+  .badge.caution { background:rgba(251,191,36,.15); color:var(--amber); }
+  .plan-totals { display:flex; gap:24px; flex-wrap:wrap; margin-bottom:8px; font-size:14px; }
+  .plan-totals span strong { font-size:16px; }
   .tally { margin-top:12px; font-size:14px; color:var(--muted); }
   .tally strong { color:var(--green); }
   .explanation { white-space:pre-wrap; line-height:1.5; font-size:14px; margin-top:12px; }
   .muted { color:var(--muted); }
   .disclaimer { font-size:12px; color:var(--muted); margin-top:8px; }
+  .settings-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:24px; }
+  .settings-grid input, .settings-grid select { width:100%; margin-bottom:8px; }
+  .settings-grid .row { display:flex; gap:8px; }
+  .settings-grid .row > * { flex:1; }
+  .extra-list { font-size:13px; color:var(--muted); margin-top:10px; line-height:1.6; }
+  .extra-list strong { color:var(--text); }
+  .saved-note { font-size:12px; color:var(--green); margin-top:4px; min-height:16px; }
+  @media (max-width: 800px) { .settings-grid { grid-template-columns:1fr; } .grid { grid-template-columns:repeat(2,1fr); } }
 </style>
 </head>
 <body>
@@ -57,7 +73,11 @@
     <div class="stat"><div class="label">Portfolio Value</div><div class="value" id="s_value">—</div></div>
     <div class="stat"><div class="label">Unrealized G/L</div><div class="value" id="s_unrealized">—</div></div>
     <div class="stat"><div class="label">Realized G/L (YTD)</div><div class="value" id="s_realized">—</div></div>
-    <div class="stat"><div class="label">Recommended Tax Savings</div><div class="value green" id="s_savings">—</div></div>
+    <div class="stat">
+      <div class="label">Plan Tax Savings (this year)</div>
+      <div class="value green" id="s_savings">—</div>
+      <div class="subvalue" id="s_net"></div>
+    </div>
   </div>
   <div class="disclaimer" id="budgetLine"></div>
 
@@ -66,9 +86,20 @@
     <div class="controls">
       <div><label>Short-term rate</label><input id="shortRate" type="number" step="0.01" value="0.15"></div>
       <div><label>Long-term rate</label><input id="longRate" type="number" step="0.01" value="0.05"></div>
-      <div><label>Min. savings ($)</label><input id="minSavings" type="number" step="1" value="0"></div>
+      <div><label>Min. step savings ($)</label><input id="minSavings" type="number" step="1" value="0"></div>
       <button onclick="reloadAll()">Update</button>
     </div>
+  </div>
+
+  <!-- HARVEST PLAN (the headline) -->
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+      <h2>Harvest Plan — do these, in this order</h2>
+      <div class="sub" id="planStop"></div>
+    </div>
+    <div class="plan-totals" id="planTotals"></div>
+    <div id="planArea"><p class="muted">Loading…</p></div>
+    <div id="planExtras" class="extra-list"></div>
   </div>
 
   <!-- HOLDINGS -->
@@ -77,11 +108,74 @@
     <div id="holdingsArea"><p class="muted">Loading…</p></div>
   </div>
 
-  <!-- HARVEST TABLE -->
+  <!-- HARVEST TABLE (per-lot view) -->
   <div class="card">
-    <h2>Harvest Opportunities</h2>
+    <h2>Harvest Opportunities (per lot)</h2>
+    <div class="disclaimer" style="margin:0 0 8px;">Each row is priced independently against today's position — the numbers are comparable but don't sum. The Plan above is what they add up to when executed in sequence.</div>
     <div id="oppArea"><p class="muted">Loading…</p></div>
     <div class="tally" id="tally"></div>
+  </div>
+
+  <!-- SETTINGS -->
+  <div class="card">
+    <h2>Tax &amp; Account Settings</h2>
+    <div class="settings-grid">
+      <div>
+        <h3>Carryforward &amp; future rate</h3>
+        <label>Prior-year carryforward — short-term ($)</label>
+        <input id="cfSt" type="number" step="1" min="0" value="0">
+        <label>Prior-year carryforward — long-term ($)</label>
+        <input id="cfLt" type="number" step="1" min="0" value="0">
+        <label>Expected future LT rate (blank = today's)</label>
+        <input id="futRate" type="number" step="0.01" min="0" max="1" placeholder="e.g. 0.15">
+        <button class="small" onclick="saveTaxSettings()">Save tax settings</button>
+        <div class="saved-note" id="taxSaved"></div>
+      </div>
+      <div>
+        <h3>Watch-only accounts</h3>
+        <div class="disclaimer" style="margin:0 0 8px;">Other brokers &amp; retirement accounts. We never sell from these — we only count their buys against the wash-sale window. An IRA buy destroys a harvested loss permanently.</div>
+        <div class="row">
+          <input id="extName" placeholder="Name (Fidelity Roth IRA)">
+          <select id="extType">
+            <option value="taxable">taxable</option>
+            <option value="traditional_ira">traditional IRA</option>
+            <option value="roth_ira">Roth IRA</option>
+            <option value="401k">401(k)</option>
+            <option value="hsa">HSA</option>
+            <option value="other">other</option>
+          </select>
+        </div>
+        <div class="row">
+          <input id="extBroker" placeholder="Broker">
+          <button class="small" onclick="addExternalAccount()">Add account</button>
+        </div>
+        <div id="extList" class="extra-list"></div>
+        <h3 style="margin-top:14px;">Record a buy seen there</h3>
+        <div class="row">
+          <select id="extAcctSel"></select>
+          <select id="extSymbol"></select>
+        </div>
+        <div class="row">
+          <input id="extQty" type="number" step="any" min="0" placeholder="Qty">
+          <input id="extDate" type="date">
+          <button class="small" onclick="recordExternalBuy()">Record</button>
+        </div>
+        <div class="saved-note" id="extSaved"></div>
+      </div>
+      <div>
+        <h3>Dividend reinvestment (DRIP)</h3>
+        <div class="disclaimer" style="margin:0 0 8px;">An automatic reinvestment is a purchase the wash-sale rule counts. Declare it so we can warn you to turn it off before harvesting.</div>
+        <label>Security</label>
+        <select id="dripSymbol" onchange="showDripFor()"></select>
+        <label style="display:flex; align-items:center; gap:8px; margin:8px 0;">
+          <input id="dripOn" type="checkbox" style="width:auto;"> Reinvestment is ON at my broker
+        </label>
+        <label>Next (or most recent) dividend date</label>
+        <input id="dripDate" type="date">
+        <button class="small" onclick="saveDrip()">Save DRIP settings</button>
+        <div class="saved-note" id="dripSaved"></div>
+      </div>
+    </div>
   </div>
 
   <!-- PRICE CHART -->
@@ -114,6 +208,7 @@
 
 <script>
 let realizedCache = [];
+let securitiesCache = [];
 let priceChart = null;
 
 function rates() {
@@ -124,6 +219,12 @@ function money(n) {
   return (v < 0 ? '-$' : '$') + Math.abs(v).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
 }
 function cls(n) { return Number(n) < 0 ? 'red' : 'green'; }
+function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function flash(id, text) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  setTimeout(() => { el.textContent = ''; }, 4000);
+}
 
 function renderSummary(s) {
   document.getElementById('s_value').textContent = money(s.total_market_value);
@@ -132,8 +233,15 @@ function renderSummary(s) {
   const r = document.getElementById('s_realized');
   r.textContent = money(s.realized_ytd_total); r.className = 'value ' + cls(s.realized_ytd_total);
   document.getElementById('s_savings').textContent = money(s.harvestable_recommended_savings);
+  document.getElementById('s_net').textContent =
+    (s.harvestable_net_benefit !== null && s.harvestable_net_benefit !== undefined)
+      ? `net after future tax ≈ ${money(s.harvestable_net_benefit)}`
+      : '';
+  const carryIn = Number(s.carryforward_short || 0) + Number(s.carryforward_long || 0);
   document.getElementById('budgetLine').textContent =
-    `Useful loss budget this year ≈ ${money(s.useful_loss_budget)} (realized gains + $3,000 ordinary income offset).`;
+    `Useful loss budget this year ≈ ${money(s.useful_loss_budget)}`
+    + (carryIn > 0 ? ` (after your ${money(carryIn)} carryforward)` : ' (realized gains + $3,000 ordinary income offset)')
+    + '.';
   document.getElementById('asOf').textContent = s.prices_as_of
     ? 'Prices as of ' + new Date(s.prices_as_of).toLocaleString()
     : 'Prices not yet refreshed';
@@ -145,6 +253,120 @@ async function loadSummary() {
   renderSummary(await res.json());
 }
 
+// ---------- HARVEST PLAN ----------
+function stepBadges(s) {
+  let b = '';
+  if (s.drip_risk) b += ` <span class="badge caution" title="${esc(s.drip_warning)}">DRIP</span>`;
+  return b;
+}
+
+async function loadPlan() {
+  const area = document.getElementById('planArea');
+  const minSave = Number(document.getElementById('minSavings').value) || 0;
+  const res = await fetch(`/harvest-plan?${rates()}&min_step_savings=${minSave}`);
+  if (!res.ok) { area.innerHTML = '<p class="muted">Could not load the plan.</p>'; return; }
+  const plan = await res.json();
+
+  document.getElementById('planTotals').innerHTML = plan.steps.length ? `
+    <span>Saves now <strong class="green">${money(plan.total_current_year_savings)}</strong></span>
+    <span>Likely costs later <strong class="red">${money(plan.total_future_tax_cost)}</strong>
+      <span class="muted">(at ${(Number(plan.expected_future_rate_used)*100).toFixed(0)}% future rate)</span></span>
+    <span>Net <strong class="${cls(plan.total_net_benefit)}">${money(plan.total_net_benefit)}</strong></span>
+    <span class="muted">+ ${money(plan.total_carryforward_generated)} banked as carryforward</span>` : '';
+
+  document.getElementById('planStop').textContent =
+    plan.stop_reason === 'no_further_current_year_benefit'
+      ? 'Stopped where this-year benefit runs out'
+      : (plan.steps.length ? 'All candidates used' : '');
+
+  if (!plan.steps.length) {
+    area.innerHTML = '<p class="muted">Nothing to harvest right now — no losing lots with current-year benefit.</p>';
+  } else {
+    const rows = plan.steps.map(s => `
+      <tr>
+        <td>${s.step}</td>
+        <td><strong>${esc(s.symbol)}</strong>${stepBadges(s)}</td>
+        <td>${s.quantity_remaining}</td>
+        <td>${s.term}</td>
+        <td class="red">${money(s.unrealized_loss)}</td>
+        <td class="green">${money(s.step_savings)}</td>
+        <td class="red">${money(s.step_future_tax_cost)}</td>
+        <td class="${cls(s.step_net_benefit)}">${money(s.step_net_benefit)}</td>
+        <td class="green">${money(s.cumulative_savings)}</td>
+        <td>${s.lot_broker
+              ? `<button class="small" onclick="executeStep(this)" data-lot="${s.lot_id}" data-symbol="${esc(s.symbol)}" data-qty="${s.quantity_remaining}" data-broker="${esc(s.lot_broker)}">Sell lot #${s.lot_id}</button>`
+              : '<span class="muted" title="This lot has no broker recorded, so a specific-lot sell cannot be routed.">no broker</span>'}</td>
+      </tr>`).join('');
+    area.innerHTML = `
+      <table>
+        <thead><tr>
+          <th>#</th><th>Symbol</th><th>Qty</th><th>Term</th><th>Loss</th>
+          <th>Saves now</th><th>Costs later</th><th>Net</th><th>Cumulative</th><th>Execute</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  let extras = '';
+  if (plan.carryforward_only.length) {
+    extras += `<div style="margin-top:10px;"><strong>Carryforward only</strong> — selling these adds $0 this year (deferral only): `
+      + plan.carryforward_only.map(c =>
+          `${esc(c.symbol)} lot #${c.lot_id} (${money(c.unrealized_loss)} → banks ${money(c.carryforward_if_harvested)})`
+        ).join(' · ')
+      + `</div>`;
+  }
+  if (plan.excluded_wash_sale.length) {
+    extras += `<div style="margin-top:10px;"><strong class="red">Excluded — wash-sale risk</strong>: `
+      + plan.excluded_wash_sale.map(e =>
+          `<span title="${esc(e.reason)}">${esc(e.symbol)} lot #${e.lot_id}${(e.reason||'').includes('PERMANENTLY') ? ' <span class="badge warn">PERMANENT</span>' : ''}</span>`
+        ).join(' · ')
+      + `</div>`;
+  }
+  document.getElementById('planExtras').innerHTML = extras;
+}
+
+// Two-click execute: first click arms the button, second fires the
+// specific-lot market sell. No browser confirm() dialogs.
+async function executeStep(btn) {
+  if (btn.dataset.armed !== '1') {
+    btn.dataset.armed = '1';
+    btn.textContent = 'Confirm sell?';
+    btn.classList.add('danger-armed');
+    setTimeout(() => {
+      btn.dataset.armed = '0';
+      btn.textContent = `Sell lot #${btn.dataset.lot}`;
+      btn.classList.remove('danger-armed');
+    }, 5000);
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = 'Selling…';
+  const res = await fetch('/transactions/market', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      symbol: btn.dataset.symbol,
+      quantity: btn.dataset.qty,
+      transaction_type: 'SELL',
+      broker: btn.dataset.broker,
+      fees: 0,
+      currency: 'USD',
+      lot_selection: 'specific',
+      lot_ids: [Number(btn.dataset.lot)],
+    }),
+  });
+  if (res.ok) {
+    btn.textContent = 'Sold ✓';
+    recomputeTax();               // refresh the cache, then repaint everything
+  } else {
+    const err = await res.json().catch(() => ({}));
+    btn.textContent = 'Failed';
+    btn.title = err.detail || 'Sell failed';
+    btn.disabled = false;
+    btn.dataset.armed = '0';
+  }
+}
+
 async function loadPortfolio() {
   const res = await fetch('/portfolio');
   const data = await res.json();
@@ -152,7 +374,7 @@ async function loadPortfolio() {
   if (!data.length) { area.innerHTML = '<p class="muted">No holdings yet.</p>'; return; }
   const rows = data.map(h => `
     <tr>
-      <td><strong>${h.symbol}</strong></td>
+      <td><strong>${esc(h.symbol)}</strong></td>
       <td>${h.quantity}</td>
       <td>${money(h.cost_basis)}</td>
       <td>${money(h.market_value)}</td>
@@ -163,6 +385,19 @@ async function loadPortfolio() {
       <thead><tr><th>Symbol</th><th>Quantity</th><th>Cost Basis</th><th>Market Value</th><th>Unrealized G/L</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
+}
+
+function oppStatus(o) {
+  if (o.recommended && !o.drip_risk) return '<span class="badge ok">Recommended</span>';
+  let out = [];
+  if (o.wash_sale_risk) {
+    const label = o.wash_sale_permanent ? 'PERMANENT wash risk' : 'Wash-sale risk';
+    out.push(`<span class="badge warn" title="${esc(o.wash_sale_reason)}">${label}</span>`);
+  } else {
+    out.push('<span class="badge ok">Recommended</span>');
+  }
+  if (o.drip_risk) out.push(`<span class="badge caution" title="${esc(o.drip_warning)}">DRIP</span>`);
+  return out.join(' ');
 }
 
 async function loadOpportunities() {
@@ -187,36 +422,142 @@ async function loadOpportunities() {
 
   const rows = opps.map(o => `
     <tr>
-      <td><strong>${o.symbol}</strong></td>
+      <td><strong>${esc(o.symbol)}</strong></td>
       <td>${o.quantity_remaining}</td>
       <td class="red">${money(o.unrealized_loss)}</td>
       <td>${o.term}</td>
       <td class="green">${money(o.estimated_tax_savings)}</td>
-      <td>${(repMap[o.symbol] && repMap[o.symbol].length) ? repMap[o.symbol].join(', ') : '—'}</td>
-      <td>${o.recommended ? '<span class="badge ok">Recommended</span>' : '<span class="badge warn">Wash-sale risk</span>'}</td>
+      <td class="${cls(o.net_benefit)}">${money(o.net_benefit)}</td>
+      <td>${(repMap[o.symbol] && repMap[o.symbol].length) ? esc(repMap[o.symbol].join(', ')) : '—'}</td>
+      <td title="${o.safe_to_rebuy_after ? 'Safe to rebuy after ' + o.safe_to_rebuy_after : ''}">${oppStatus(o)}</td>
     </tr>`).join('');
 
   area.innerHTML = `
     <table>
       <thead><tr>
         <th>Symbol</th><th>Qty</th><th>Unrealized Loss</th><th>Term</th>
-        <th>Est. Tax Savings</th><th>Buy Instead</th><th>Status</th>
+        <th>Saves Now</th><th>Net Benefit</th><th>Buy Instead</th><th>Status</th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
 
   const totalLoss = opps.reduce((a,o)=>a+Number(o.unrealized_loss),0);
-  const totalSave = opps.filter(o=>o.recommended).reduce((a,o)=>a+Number(o.estimated_tax_savings),0);
   document.getElementById('tally').innerHTML =
-    `If you harvest all shown: total loss booked ${money(totalLoss)} · estimated tax saved <strong>${money(totalSave)}</strong>`;
+    `Per-lot figures don't sum — see the <strong>Harvest Plan</strong> above for what harvesting actually yields in sequence. Total loss available: ${money(totalLoss)}.`;
 }
 
-async function loadSecuritiesIntoSelect() {
+// ---------- SETTINGS ----------
+async function loadTaxSettings() {
+  const res = await fetch('/tax-settings');
+  if (!res.ok) return;
+  const s = await res.json();
+  document.getElementById('cfSt').value = Number(s.carryforward_st) || 0;
+  document.getElementById('cfLt').value = Number(s.carryforward_lt) || 0;
+  document.getElementById('futRate').value = s.expected_future_lt_rate ?? '';
+}
+
+async function saveTaxSettings() {
+  const fut = document.getElementById('futRate').value;
+  const res = await fetch('/tax-settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      carryforward_st: document.getElementById('cfSt').value || '0',
+      carryforward_lt: document.getElementById('cfLt').value || '0',
+      expected_future_lt_rate: fut === '' ? null : fut,
+    }),
+  });
+  if (res.ok) { flash('taxSaved', 'Saved — recomputing…'); recomputeTax(); }
+  else flash('taxSaved', 'Save failed');
+}
+
+async function loadExternalAccounts() {
+  const res = await fetch('/external-accounts');
+  if (!res.ok) return;
+  const accts = await res.json();
+  document.getElementById('extList').innerHTML = accts.length
+    ? accts.map(a => `<div><strong>${esc(a.name)}</strong> — ${esc(a.account_type)}${a.is_retirement ? ' <span class="badge warn">retirement</span>' : ''}</div>`).join('')
+    : '<div>No watch-only accounts yet.</div>';
+  document.getElementById('extAcctSel').innerHTML =
+    accts.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join('');
+}
+
+async function addExternalAccount() {
+  const name = document.getElementById('extName').value.trim();
+  const broker = document.getElementById('extBroker').value.trim();
+  if (!name || !broker) { flash('extSaved', 'Name and broker required'); return; }
+  const res = await fetch('/external-accounts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, broker, account_type: document.getElementById('extType').value }),
+  });
+  if (res.ok) {
+    document.getElementById('extName').value = '';
+    document.getElementById('extBroker').value = '';
+    flash('extSaved', 'Account added');
+    loadExternalAccounts();
+  } else flash('extSaved', 'Add failed');
+}
+
+async function recordExternalBuy() {
+  const acct = document.getElementById('extAcctSel').value;
+  const qty = document.getElementById('extQty').value;
+  const dt = document.getElementById('extDate').value;
+  if (!acct || !qty || !dt) { flash('extSaved', 'Account, qty and date required'); return; }
+  const res = await fetch(`/external-accounts/${acct}/activities`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ symbol: document.getElementById('extSymbol').value, quantity: qty, trade_date: dt }),
+  });
+  if (res.ok) {
+    document.getElementById('extQty').value = '';
+    flash('extSaved', 'Recorded — rechecking wash sales…');
+    recomputeTax();
+  } else {
+    const err = await res.json().catch(() => ({}));
+    flash('extSaved', err.detail || 'Record failed');
+  }
+}
+
+function showDripFor() {
+  const sym = document.getElementById('dripSymbol').value;
+  const sec = securitiesCache.find(s => s.symbol === sym);
+  if (!sec) return;
+  document.getElementById('dripOn').checked = !!sec.drip_enabled;
+  document.getElementById('dripDate').value = sec.next_dividend_date || '';
+}
+
+async function saveDrip() {
+  const sym = document.getElementById('dripSymbol').value;
+  if (!sym) return;
+  const dt = document.getElementById('dripDate').value;
+  const res = await fetch(`/securities/${sym}/dividends`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      drip_enabled: document.getElementById('dripOn').checked,
+      next_dividend_date: dt || null,
+    }),
+  });
+  if (res.ok) {
+    flash('dripSaved', 'Saved — recomputing…');
+    await loadSecurities();
+    recomputeTax();
+  } else flash('dripSaved', 'Save failed');
+}
+
+async function loadSecurities() {
   const res = await fetch('/securities');
-  const secs = await res.json();
-  const sel = document.getElementById('chartSymbol');
-  sel.innerHTML = secs.map(s => `<option value="${s.symbol}">${s.symbol}</option>`).join('');
-  if (secs.length) loadChart();
+  securitiesCache = await res.json();
+  const opts = securitiesCache.map(s => `<option value="${esc(s.symbol)}">${esc(s.symbol)}</option>`).join('');
+  const chartSel = document.getElementById('chartSymbol');
+  const hadChart = chartSel.value;
+  chartSel.innerHTML = opts;
+  if (hadChart) chartSel.value = hadChart;
+  document.getElementById('dripSymbol').innerHTML = opts;
+  document.getElementById('extSymbol').innerHTML = opts;
+  showDripFor();
+  if (securitiesCache.length && !priceChart) loadChart();
 }
 
 async function loadChart() {
@@ -254,23 +595,26 @@ async function loadRealized() {
   const rows = realizedCache.map(r => `
     <tr>
       <td>${r.sell_date}</td>
-      <td><strong>${r.symbol}</strong></td>
+      <td><strong>${esc(r.symbol)}</strong></td>
       <td>${r.quantity_sold}</td>
       <td>${money(r.proceeds)}</td>
       <td>${money(r.cost_basis)}</td>
       <td class="${cls(r.gain_loss)}">${money(r.gain_loss)}</td>
+      <td>${Number(r.disallowed_wash_loss) > 0
+            ? `<span class="badge warn" title="${esc(r.wash_sale_note)}">washed ${money(r.disallowed_wash_loss)}</span>`
+            : '—'}</td>
       <td>${r.term}</td>
     </tr>`).join('');
   area.innerHTML = `
     <table>
-      <thead><tr><th>Date</th><th>Symbol</th><th>Qty</th><th>Proceeds</th><th>Cost Basis</th><th>Gain/Loss</th><th>Term</th></tr></thead>
+      <thead><tr><th>Date</th><th>Symbol</th><th>Qty</th><th>Proceeds</th><th>Cost Basis</th><th>Gain/Loss (tax)</th><th>Wash</th><th>Term</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
 }
 
 function exportCSV() {
-  if (!realizedCache.length) { alert('No realized gains to export.'); return; }
-  const header = ['sell_date','symbol','quantity_sold','proceeds','cost_basis','gain_loss','term'];
+  if (!realizedCache.length) { flash('taxSaved', 'No realized gains to export.'); return; }
+  const header = ['sell_date','symbol','quantity_sold','proceeds','cost_basis','gain_loss','disallowed_wash_loss','term'];
   const lines = [header.join(',')];
   realizedCache.forEach(r => lines.push(header.map(h => r[h]).join(',')));
   const blob = new Blob([lines.join('\n')], {type:'text/csv'});
@@ -320,9 +664,10 @@ async function recomputeTax() {
   setTimeout(reloadAll, 1500);
 }
 
-function reloadAll() { loadSummary(); loadPortfolio(); loadOpportunities(); loadRealized(); }
+function reloadAll() { loadSummary(); loadPlan(); loadPortfolio(); loadOpportunities(); loadRealized(); loadExternalAccounts(); }
 reloadAll();
-loadSecuritiesIntoSelect();
+loadSecurities();
+loadTaxSettings();
 
 // Live summary: the server pushes a fresh summary over the websocket whenever
 // the streamer reports a price change. renderSummary paints it — no refetch.
