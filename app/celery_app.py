@@ -7,7 +7,7 @@ import redis
 import json
 import os
 from groq import Groq
-from app.harvest import build_harvest_opportunities
+from app.harvest import build_harvest_opportunities, build_harvest_plan
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -92,9 +92,13 @@ def run_tax_analysis(short_term_rate="0.40", long_term_rate="0.20"):
     db = SessionLocal()
     try:
         opportunities = build_harvest_opportunities(db, Decimal(short_term_rate), Decimal(long_term_rate))
+        # The sequenced plan is cached alongside the per-lot list: the summary's
+        # headline savings figure comes from the plan (true cumulative value),
+        # while the dashboard table still shows the per-lot view.
+        plan = build_harvest_plan(db, Decimal(short_term_rate), Decimal(long_term_rate))
         generated_at = datetime.now(timezone.utc).isoformat()
 
-        result = {"opportunities": opportunities, "generated_at": generated_at}
+        result = {"opportunities": opportunities, "plan": plan, "generated_at": generated_at}
         redis_client.set("tax_analysis", json.dumps(result, default=str))
         return {"count": len(opportunities)}
     finally:

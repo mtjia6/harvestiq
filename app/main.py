@@ -24,9 +24,9 @@ from starlette.concurrency import run_in_threadpool
 import redis.asyncio as aioredis
 
 from app.database import get_db, SessionLocal
-from app.model import TransactionDB, SecurityDB, TaxLotDB, RealizedGainDB
+from app.model import TransactionDB, SecurityDB, TaxLotDB, RealizedGainDB, TaxSettingsDB
 from app.celery_app import celery_app, redis_client, generate_harvest_explanation, run_tax_analysis
-from app.harvest import build_harvest_opportunities, get_ytd_realized_totals, build_portfolio_summary
+from app.harvest import build_harvest_opportunities, build_harvest_plan, get_ytd_realized_totals, build_portfolio_summary
 from app import prices
 from app.prices import PriceUnavailable
 
@@ -700,6 +700,62 @@ def get_wash_sales(db: Session = Depends(get_db)):
     return results
 
 
+class TaxSettingsIn(BaseModel):
+    """Prior-year capital-loss carryforwards, as POSITIVE loss amounts."""
+
+    carryforward_st: Decimal = Field(ge=0, default=Decimal("0"))
+    carryforward_lt: Decimal = Field(ge=0, default=Decimal("0"))
+
+
+class TaxSettingsOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    carryforward_st: Money
+    carryforward_lt: Money
+
+
+@app.get(
+    "/tax-settings",
+    tags=["Tax analysis"],
+    response_model=TaxSettingsOut,
+    summary="Prior-year carryforward inputs",
+    description=(
+        "The one tax input the engine cannot derive from transaction history: "
+        "the capital-loss carryforward brought into this year, split by "
+        "short/long character. Zeros if never set."
+    ),
+)
+def get_tax_settings(db: Session = Depends(get_db)):
+    settings = db.query(TaxSettingsDB).first()
+    if settings is None:
+        return TaxSettingsOut(carryforward_st=Decimal("0"), carryforward_lt=Decimal("0"))
+    return settings
+
+
+@app.put(
+    "/tax-settings",
+    tags=["Tax analysis"],
+    response_model=TaxSettingsOut,
+    summary="Set prior-year carryforwards",
+    description=(
+        "Upserts the single settings row. Amounts are POSITIVE losses (a "
+        "$22,000 carryforward is `22000`, not `-22000`). These feed directly "
+        "into the effective net position every harvest valuation starts from, "
+        "so re-run `POST /tax-analysis/run` after changing them."
+    ),
+)
+def put_tax_settings(payload: TaxSettingsIn, db: Session = Depends(get_db)):
+    settings = db.query(TaxSettingsDB).first()
+    if settings is None:
+        settings = TaxSettingsDB(id=1)
+        db.add(settings)
+    settings.carryforward_st = payload.carryforward_st
+    settings.carryforward_lt = payload.carryforward_lt
+    db.commit()
+    db.refresh(settings)
+    return settings
+
+
 @app.get(
     "/harvest-opportunities",
     tags=["Tax analysis"],
@@ -718,6 +774,32 @@ def get_harvest_opportunities(
     db: Session = Depends(get_db),
 ):
     return build_harvest_opportunities(db, short_term_rate, long_term_rate)
+
+
+@app.get(
+    "/harvest-plan",
+    tags=["Tax analysis"],
+    summary="Ordered, executable harvest plan (portfolio-level)",
+    description=(
+        "The portfolio-level answer: lots priced SEQUENTIALLY against the "
+        "evolving net position, so each step's savings is its true marginal "
+        "value given everything harvested before it, and the cumulative total "
+        "is what you'd actually save. Steps stop where current-year benefit "
+        "runs out; lots past that line appear under `carryforward_only` "
+        "(deferral, not savings). Wash-sale-risky lots are excluded and "
+        "listed with reasons. Computed live on every call — expensive."
+    ),
+)
+def get_harvest_plan(
+    short_term_rate: RateQuery = SHORT_TERM_TAX_RATE,
+    long_term_rate: RateQuery = LONG_TERM_TAX_RATE,
+    min_step_savings: Annotated[
+        Decimal,
+        Query(ge=0, description="Skip steps saving less than this many dollars this year."),
+    ] = Decimal("0"),
+    db: Session = Depends(get_db),
+):
+    return build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings)
 
 
 @app.post(
@@ -848,8 +930,10 @@ def _build_summary(db):
     # summary computation in harvest.py. Both the HTTP endpoint and the
     # websocket push call this, so the math lives in exactly one place.
     raw = redis_client.get("tax_analysis")
-    opportunities = json.loads(raw)["opportunities"] if raw else []
-    summary = build_portfolio_summary(db, opportunities)
+    cached = json.loads(raw) if raw else {}
+    opportunities = cached.get("opportunities", [])
+    plan = cached.get("plan")  # None on a pre-plan cache: summary falls back
+    summary = build_portfolio_summary(db, opportunities, plan)
     raw_ts = redis_client.get("prices_last_refreshed")
     summary["prices_as_of"] = raw_ts.decode() if raw_ts else None
     return summary

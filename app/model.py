@@ -66,3 +66,18 @@ class RealizedGainDB(Base):
     gain_loss: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
     term: Mapped[str] = mapped_column(String)
     sell_date: Mapped[datetime.date] = mapped_column(Date)
+
+
+class TaxSettingsDB(Base):
+    """Single-row table (id=1) of tax inputs the engine can't derive from
+    transactions — currently the prior-year capital-loss carryforwards.
+
+    Carryforwards are stored as POSITIVE loss amounts, split by character
+    (short/long), because a carryforward re-enters the new year as a loss of
+    the same character it had when it was generated.
+    """
+    __tablename__ = "tax_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    carryforward_st: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8), default=decimal.Decimal("0"))
+    carryforward_lt: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8), default=decimal.Decimal("0"))
