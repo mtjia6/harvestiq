@@ -57,7 +57,13 @@ class TaxLotDB(Base):
     quantity_remaining: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
     broker: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     cost_basis_per_unit: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
+    # opened_date is ALWAYS the actual purchase date (FIFO ordering and the
+    # wash-sale window both need the real acquisition date).
     opened_date: Mapped[datetime.date] = mapped_column(Date)
+    # holding_period_date is the date used for short/long-term classification.
+    # Null means "same as opened_date". It diverges only when a wash sale
+    # tacks the sold shares' holding period onto this lot's shares.
+    holding_period_date: Mapped[Optional[datetime.date]] = mapped_column(Date, nullable=True)
     status: Mapped[str] = mapped_column(String)
     # Shares of this lot already claimed as wash-sale replacement shares, so
     # the same shares can't absorb two different disallowed losses.

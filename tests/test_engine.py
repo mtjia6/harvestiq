@@ -362,8 +362,10 @@ def test_buy_side_wash_sale_disallows_and_adjusts_basis():
     assert len(lots) == 1
     # $150 purchase + $500/10 disallowed loss = $200/share adjusted basis
     assert float(lots[0]["cost_basis_per_unit"]) == pytest.approx(200)
-    # Tacking: opened Feb 15 minus the 31 days the old lot was held = Jan 15
-    assert lots[0]["opened_date"] == "2026-01-15"
+    # opened_date stays the REAL purchase date; the tack lives in
+    # holding_period_date: Feb 15 minus the 31 days the old lot was held.
+    assert lots[0]["opened_date"] == "2026-02-15"
+    assert lots[0]["holding_period_date"] == "2026-01-15"
 
 
 def test_sell_side_wash_sale_partial_disallowance():
@@ -662,3 +664,71 @@ def test_future_rate_defaults_to_current_lt_rate():
     ).json()
     losa = [o for o in opps if o["symbol"] == "LOSA"][0]
     assert float(losa["expected_future_rate_used"]) == pytest.approx(0.15)
+
+
+# ---------- wash-lot splitting & holding-period integrity (review fixes) ----------
+def test_partial_wash_splits_replacement_into_two_lots():
+    # Sell 40 shares at a $400 loss; 100 replacement shares bought in the
+    # window. The loss attaches to 40 of them, NOT smeared over all 100:
+    #   -> 40 shares @ $60 (basis + $10/sh), holding period tacked
+    #   -> 60 shares @ $50, clean basis, clean age
+    add_security("AAPL")
+    buy("AAPL", 40, 100, "2025-06-01")             # old lot, will be sold
+    buy("AAPL", 100, 50, "2026-02-20")             # replacement purchase
+    r = client.post("/transactions", json={
+        "symbol": "AAPL", "quantity": 40, "price": 90,
+        "transaction_type": "SELL", "trade_date": "2026-03-01",
+        "broker": "test", "fees": 0, "currency": "USD",
+        "lot_selection": "specific",
+        "lot_ids": [client.get("/tax-lots").json()[0]["id"]],
+    })
+    assert r.status_code == 201
+
+    open_lots = sorted(
+        [l for l in client.get("/tax-lots").json() if l["status"] == "open"],
+        key=lambda l: float(l["cost_basis_per_unit"]),
+    )
+    assert len(open_lots) == 2
+    clean, washed = open_lots
+    assert float(clean["quantity_remaining"]) == pytest.approx(60)
+    assert float(clean["cost_basis_per_unit"]) == pytest.approx(50)
+    assert clean["holding_period_date"] is None            # age untouched
+    assert float(washed["quantity_remaining"]) == pytest.approx(40)
+    assert float(washed["cost_basis_per_unit"]) == pytest.approx(60)
+    assert washed["opened_date"] == "2026-02-20"           # real buy date kept
+    # tacked back by the sold shares' age (2025-06-01 -> 2026-03-01 = 273 days)
+    assert washed["holding_period_date"] == "2025-05-23"
+
+
+def test_two_washes_into_one_purchase_age_independently():
+    # Two losing sales wash into the SAME June-1 purchase. Each sale must age
+    # only the shares it washed into — the old code backdated the whole lot
+    # twice (200 days, then 100 more), silently making it long-term early.
+    add_security("AAPL")
+    buy("AAPL", 10, 200, "2026-01-01")             # lot A
+    buy("AAPL", 10, 200, "2026-03-01")             # lot B
+    buy("AAPL", 20, 100, "2026-06-01")             # the replacement purchase
+    lots = client.get("/tax-lots").json()
+    lot_a = [l for l in lots if l["opened_date"] == "2026-01-01"][0]
+    lot_b = [l for l in lots if l["opened_date"] == "2026-03-01"][0]
+
+    def specific_sell(lot_id, day):
+        return client.post("/transactions", json={
+            "symbol": "AAPL", "quantity": 10, "price": 150,
+            "transaction_type": "SELL", "trade_date": day,
+            "broker": "test", "fees": 0, "currency": "USD",
+            "lot_selection": "specific", "lot_ids": [lot_id],
+        })
+
+    assert specific_sell(lot_a["id"], "2026-06-10").status_code == 201  # held 160d
+    assert specific_sell(lot_b["id"], "2026-06-10").status_code == 201  # held 101d
+
+    replacements = [
+        l for l in client.get("/tax-lots").json()
+        if l["status"] == "open" and l["opened_date"] == "2026-06-01"
+    ]
+    # 20 shares split 10/10, one tack each — computed from each sale's own
+    # holding period, never compounded.
+    assert len(replacements) == 2
+    dates = sorted(l["holding_period_date"] for l in replacements)
+    assert dates == ["2025-12-23", "2026-02-20"]   # 6/1 - 160d and 6/1 - 101d

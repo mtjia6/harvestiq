@@ -243,7 +243,7 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
         if unrealized >= 0:
             continue
 
-        term = holding_term(lot.opened_date, today)
+        term = holding_term(effective_holding_date(lot), today)
 
         estimated_tax_savings, carryforward_generated = marginal_harvest_value(
             -unrealized, term, net_st, net_lt, short_term_rate, long_term_rate
@@ -384,20 +384,34 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
     return opportunities
 
 
+def effective_holding_date(lot):
+    """The date used for short/long-term classification. opened_date is the
+    ACTUAL purchase date; holding_period_date overrides it when a wash sale
+    has tacked the sold shares' age onto this lot's shares."""
+    return lot.holding_period_date or lot.opened_date
+
+
 def _transfer_disallowed_loss(db, realized, replacement_lot, sell_date):
     """Move as much of `realized`'s not-yet-disallowed loss as `replacement_lot`
     can absorb. Implements the two legs of IRC §1091:
 
       - the loss is DISALLOWED for tax purposes (realized.gain_loss moves
         toward zero; the amount is recorded in disallowed_wash_loss), and
-      - it doesn't vanish: it's added to the replacement lot's basis, and the
-        replacement's holding period is tacked back by the sold lot's holding
-        period, so the deferred loss keeps its seniority.
+      - it doesn't vanish: it attaches to the replacement SHARES — basis up
+        by the disallowed amount, holding period tacked back by the sold
+        shares' age.
 
-    Simplification (documented): the basis bump and the tacked date are
-    spread across the replacement lot's remaining shares rather than
-    splitting the lot. Total basis is exactly right; per-share attribution
-    is approximate when a lot is only partially a replacement.
+    Sold shares match replacement shares one-for-one, so a PARTIAL wash
+    SPLITS the lot: the washed shares are carved into their own lot with
+    the adjusted basis and tacked holding date, and the clean shares keep
+    their real basis and age. (Spreading both across the whole lot — the
+    old shortcut — kept the totals right but corrupted every future
+    per-share loss measurement and term classification on the position.)
+
+    The carved lot is created with wash_replacement_used == its full size,
+    so already-tacked shares can never absorb a second loss — which is also
+    what prevents two sales washing into one purchase from compounding the
+    backdating (each sale ages only the shares it actually washed into).
     """
     economic_loss = realized.cost_basis - realized.proceeds  # positive = loss
     remaining = economic_loss - realized.disallowed_wash_loss
@@ -412,14 +426,37 @@ def _transfer_disallowed_loss(db, realized, replacement_lot, sell_date):
     realized.disallowed_wash_loss += amount
     realized.gain_loss += amount  # gain_loss is the TAX-reportable figure
 
-    replacement_lot.cost_basis_per_unit += amount / replacement_lot.quantity_remaining
-    replacement_lot.wash_replacement_used += shares
-
-    # Holding-period tacking: the replacement inherits the sold shares' age.
+    # Tack = the sold shares' full holding period (including any tacks THEY
+    # carried) gets added to the replacement shares' age.
     loss_lot = db.query(TaxLotDB).filter(TaxLotDB.id == realized.lot_id).first()
-    if loss_lot is not None:
-        held = sell_date - loss_lot.opened_date
-        replacement_lot.opened_date = replacement_lot.opened_date - held
+    held = (sell_date - effective_holding_date(loss_lot)) if loss_lot else timedelta(0)
+    tacked_date = effective_holding_date(replacement_lot) - held
+
+    if shares < replacement_lot.quantity_remaining:
+        # Partial wash: split. The washed shares become their own lot.
+        carved = TaxLotDB(
+            symbol=replacement_lot.symbol,
+            open_transaction_id=replacement_lot.open_transaction_id,
+            quantity_opened=shares,
+            quantity_remaining=shares,
+            broker=replacement_lot.broker,
+            cost_basis_per_unit=replacement_lot.cost_basis_per_unit + amount / shares,
+            opened_date=replacement_lot.opened_date,       # real purchase date
+            holding_period_date=tacked_date,               # tacked age
+            status="open",
+            wash_replacement_used=shares,                  # spent: can't wash again
+        )
+        db.add(carved)
+        replacement_lot.quantity_remaining -= shares
+        replacement_lot.quantity_opened -= shares
+        # The remaining (clean) shares keep their basis and age untouched.
+    else:
+        # Full absorption: adjust in place. capacity == quantity_remaining
+        # here (a partially-used lot has capacity 0 by construction), so
+        # this fires at most once per lot — no compounded backdating.
+        replacement_lot.cost_basis_per_unit += amount / replacement_lot.quantity_remaining
+        replacement_lot.holding_period_date = tacked_date
+        replacement_lot.wash_replacement_used += shares
 
     return amount
 

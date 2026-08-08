@@ -40,6 +40,7 @@ from app.harvest import (
     get_ytd_realized_totals,
     build_portfolio_summary,
     holding_term,
+    effective_holding_date,
     apply_wash_sale_on_sell,
     apply_wash_sale_on_buy,
     apply_external_wash_on_sell,
@@ -237,6 +238,7 @@ class TaxLotOut(BaseModel):
     broker: Optional[str] = None
     cost_basis_per_unit: Money
     opened_date: date
+    holding_period_date: Optional[date] = None
     status: str
 
 
@@ -444,8 +446,9 @@ def process_transaction(transaction: Transaction, db: Session):
             cost_basis = quantity_sold * lot.cost_basis_per_unit
             gain_loss = proceeds - cost_basis
 
-            # Calendar "more than one year" rule, not `days > 365`.
-            term = holding_term(lot.opened_date, transaction.trade_date)
+            # Calendar "more than one year" rule, not `days > 365`, measured
+            # from the effective holding date (tacked when wash-adjusted).
+            term = holding_term(effective_holding_date(lot), transaction.trade_date)
 
             realized = RealizedGainDB(
                 symbol=transaction.symbol,
