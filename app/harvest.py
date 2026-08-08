@@ -140,6 +140,46 @@ def get_carryforwards(db):
     return settings.carryforward_st, settings.carryforward_lt
 
 
+def get_expected_future_rate(db, fallback_long_rate):
+    """The LT rate the user expects when eventually selling the replacement
+    position. Unset means 'same bracket as today' — the interest-free-loan
+    assumption, stated rather than hidden."""
+    settings = db.query(TaxSettingsDB).first()
+    if settings is None or settings.expected_future_lt_rate is None:
+        return fallback_long_rate
+    return settings.expected_future_lt_rate
+
+
+def deferral_math(loss_amount, current_year_savings, carryforward_generated, future_rate):
+    """The honest three numbers for one harvested loss of size L:
+
+      saves_now   — real current-year tax reduction (already computed by the
+                    netting waterfall).
+      costs_later — harvesting resets cost basis DOWN by L on the replacement
+                    position, so the eventual sale owes L x future_rate more.
+                    Harvesting defers tax; it rarely erases it.
+      net_benefit — saves_now + the future value of any carryforward generated
+                    (C x future_rate, since carryforward offsets future gains)
+                    minus costs_later. Algebra: net = saves_now - (L - C) x
+                    future_rate. Same bracket now and later, no carryforward ->
+                    net 0: "an interest-free loan," which is still worth
+                    something, but is NOT the headline savings number.
+
+    Approximations (documented, not hidden): the eventual sale is assumed
+    long-term; carryforward future value uses the same future rate regardless
+    of ST/LT character; no time-value discounting; basis step-up at death and
+    donation (where deferred gain never comes due) are ignored.
+    """
+    future_tax_cost = loss_amount * future_rate
+    future_carryforward_benefit = carryforward_generated * future_rate
+    net_benefit = current_year_savings + future_carryforward_benefit - future_tax_cost
+    return {
+        "future_tax_cost": future_tax_cost,
+        "future_carryforward_benefit": future_carryforward_benefit,
+        "net_benefit": net_benefit,
+    }
+
+
 def get_effective_net_position(db):
     """This year's net ST/LT position with prior-year carryforwards applied.
 
@@ -165,6 +205,7 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
     opportunities = []
     securities_by_symbol = {s.symbol: s for s in db.query(SecurityDB).all()}
     net_st, net_lt = get_effective_net_position(db)
+    future_rate = get_expected_future_rate(db, long_term_rate)
 
     # ONE query for every symbol's window buys (kills the old per-lot N+1).
     window_start = today - timedelta(days=WASH_SALE_WINDOW_DAYS)
@@ -206,6 +247,9 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
 
         estimated_tax_savings, carryforward_generated = marginal_harvest_value(
             -unrealized, term, net_st, net_lt, short_term_rate, long_term_rate
+        )
+        deferral = deferral_math(
+            -unrealized, estimated_tax_savings, carryforward_generated, future_rate
         )
 
         # Wash-sale rule applies to securities, not crypto (treated as property).
@@ -316,6 +360,9 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
             "term": term,
             "estimated_tax_savings": estimated_tax_savings,
             "carryforward_generated": carryforward_generated,
+            "future_tax_cost": deferral["future_tax_cost"],
+            "net_benefit": deferral["net_benefit"],
+            "expected_future_rate_used": future_rate,
             "wash_sale_risk": wash_sale_risk,
             "wash_sale_reason": wash_sale_reason,
             "wash_sale_permanent": wash_sale_permanent,
@@ -529,6 +576,7 @@ def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Dec
     """
     candidates = build_harvest_opportunities(db, short_term_rate, long_term_rate)
     net_st, net_lt = get_effective_net_position(db)
+    future_rate = get_expected_future_rate(db, long_term_rate)
 
     remaining = [o for o in candidates if o["recommended"]]
     excluded_wash_sale = [
@@ -564,6 +612,7 @@ def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Dec
         else:
             net_st -= loss
 
+        step_deferral = deferral_math(loss, step_savings, step_carryforward, future_rate)
         cumulative_savings += step_savings
         cumulative_carryforward += step_carryforward
         steps.append({
@@ -579,6 +628,8 @@ def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Dec
             "drip_warning": best["drip_warning"],
             "step_savings": step_savings,
             "step_carryforward": step_carryforward,
+            "step_future_tax_cost": step_deferral["future_tax_cost"],
+            "step_net_benefit": step_deferral["net_benefit"],
             "cumulative_savings": cumulative_savings,
             "cumulative_carryforward": cumulative_carryforward,
         })
@@ -600,15 +651,24 @@ def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Dec
             "carryforward_if_harvested": carry,
         })
 
+    total_harvest_loss = sum(
+        (-Decimal(str(s["unrealized_loss"])) for s in steps), Decimal("0")
+    )
+    total_deferral = deferral_math(
+        total_harvest_loss, cumulative_savings, cumulative_carryforward, future_rate
+    )
     return {
         "steps": steps,
         "carryforward_only": carryforward_only,
         "excluded_wash_sale": excluded_wash_sale,
         "total_current_year_savings": cumulative_savings,
         "total_carryforward_generated": cumulative_carryforward,
-        "total_harvest_loss": sum(
-            (-Decimal(str(s["unrealized_loss"])) for s in steps), Decimal("0")
-        ),
+        "total_harvest_loss": total_harvest_loss,
+        # The honest headline: "saves you $X this year, likely costs you $Y
+        # when you eventually sell the replacements, net $Z."
+        "total_future_tax_cost": total_deferral["future_tax_cost"],
+        "total_net_benefit": total_deferral["net_benefit"],
+        "expected_future_rate_used": future_rate,
         "stop_reason": stop_reason,
     }
 

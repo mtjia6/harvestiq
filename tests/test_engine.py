@@ -599,3 +599,66 @@ def test_one_external_buy_cannot_wash_two_sales():
     assert float(gains[0]["disallowed_wash_loss"]) == pytest.approx(500)
     assert float(gains[1]["disallowed_wash_loss"]) == pytest.approx(0)
     assert float(gains[1]["gain_loss"]) == pytest.approx(-500)
+
+
+# ---------- honest deferral math (saves now / costs later / net) ----------
+from app.harvest import deferral_math
+
+
+def test_same_bracket_no_carryforward_is_an_interest_free_loan():
+    # LT loss cancels LT gain at 15%; eventual sale owes it back at 15%.
+    # Saves $150 now, costs $150 later, net $0 — the "interest-free loan".
+    d = deferral_math(Decimal("1000"), Decimal("150"), Decimal("0"), Decimal("0.15"))
+    assert d["future_tax_cost"] == Decimal("150")
+    assert d["net_benefit"] == Decimal("0")
+
+
+def test_rate_arbitrage_st_now_lt_later_is_real_money():
+    # ST loss cancels ST gain at 35% now; deferred gain comes back long-term
+    # at 15%. Saves $350, costs $150 later, net +$200 — the actual win TLH
+    # is built on.
+    d = deferral_math(Decimal("1000"), Decimal("350"), Decimal("0"), Decimal("0.15"))
+    assert d["net_benefit"] == Decimal("200")
+
+
+def test_higher_future_bracket_loses_money():
+    # Save at 15% now, owe it back at 25% later: net -$100. The case the
+    # research complained nobody says out loud.
+    d = deferral_math(Decimal("1000"), Decimal("150"), Decimal("0"), Decimal("0.25"))
+    assert d["future_tax_cost"] == Decimal("250")
+    assert d["net_benefit"] == Decimal("-100")
+
+
+def test_deferral_fields_flow_through_opportunities_and_plan():
+    # ST gain on the books; ST loss harvest at 40% now, future rate set to
+    # 0.15 via settings -> per-lot and plan-level numbers agree.
+    client.put("/tax-settings", json={"expected_future_lt_rate": "0.15"})
+    add_security("GAIN", price=90)
+    buy("GAIN", 100, 50, "2026-01-05")
+    sell("GAIN", 100, 90, "2026-02-01")            # +$4,000 ST gain
+    add_security("LOSA", price=60)
+    buy("LOSA", 100, 100, "2026-01-05")            # -$4,000, short-term
+
+    opps = client.get("/harvest-opportunities").json()   # default sr=0.40
+    losa = [o for o in opps if o["symbol"] == "LOSA"][0]
+    assert float(losa["estimated_tax_savings"]) == pytest.approx(1600)   # 4000 * .40
+    assert float(losa["future_tax_cost"]) == pytest.approx(600)          # 4000 * .15
+    assert float(losa["net_benefit"]) == pytest.approx(1000)
+    assert float(losa["expected_future_rate_used"]) == pytest.approx(0.15)
+
+    plan = client.get("/harvest-plan").json()
+    assert float(plan["total_current_year_savings"]) == pytest.approx(1600)
+    assert float(plan["total_future_tax_cost"]) == pytest.approx(600)
+    assert float(plan["total_net_benefit"]) == pytest.approx(1000)
+    assert float(plan["steps"][0]["step_net_benefit"]) == pytest.approx(1000)
+
+
+def test_future_rate_defaults_to_current_lt_rate():
+    # No setting -> the engine assumes today's LT rate (stated, not hidden).
+    add_security("LOSA", price=60)
+    buy("LOSA", 100, 100, "2026-01-05")
+    opps = client.get(
+        "/harvest-opportunities?short_term_rate=0.35&long_term_rate=0.15"
+    ).json()
+    losa = [o for o in opps if o["symbol"] == "LOSA"][0]
+    assert float(losa["expected_future_rate_used"]) == pytest.approx(0.15)

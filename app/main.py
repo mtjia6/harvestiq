@@ -971,10 +971,13 @@ def get_external_activities(account_id: int, db: Session = Depends(get_db)):
 
 
 class TaxSettingsIn(BaseModel):
-    """Prior-year capital-loss carryforwards, as POSITIVE loss amounts."""
+    """Prior-year carryforwards (POSITIVE loss amounts) and the LT rate the
+    user expects to face when eventually selling replacement positions
+    (None = assume today's LT rate)."""
 
     carryforward_st: Decimal = Field(ge=0, default=Decimal("0"))
     carryforward_lt: Decimal = Field(ge=0, default=Decimal("0"))
+    expected_future_lt_rate: Optional[Decimal] = Field(ge=0, le=1, default=None)
 
 
 class TaxSettingsOut(BaseModel):
@@ -982,6 +985,7 @@ class TaxSettingsOut(BaseModel):
 
     carryforward_st: Money
     carryforward_lt: Money
+    expected_future_lt_rate: Optional[Money] = None
 
 
 @app.get(
@@ -1021,6 +1025,7 @@ def put_tax_settings(payload: TaxSettingsIn, db: Session = Depends(get_db)):
         db.add(settings)
     settings.carryforward_st = payload.carryforward_st
     settings.carryforward_lt = payload.carryforward_lt
+    settings.expected_future_lt_rate = payload.expected_future_lt_rate
     db.commit()
     db.refresh(settings)
     return settings

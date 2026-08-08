@@ -148,3 +148,10 @@ class TaxSettingsDB(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     carryforward_st: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8), default=decimal.Decimal("0"))
     carryforward_lt: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8), default=decimal.Decimal("0"))
+    # The LT capital-gains rate the user expects to face when they eventually
+    # sell the replacement position. Harvesting lowers cost basis, so the
+    # "saved" tax largely comes back due at THIS rate — if it's higher than
+    # today's, harvesting can lose money. Null = assume today's LT rate.
+    expected_future_lt_rate: Mapped[Optional[decimal.Decimal]] = mapped_column(
+        Numeric(6, 4), nullable=True
+    )
