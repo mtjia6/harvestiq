@@ -1,6 +1,6 @@
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy import Integer, String, Numeric, Date, ForeignKey
+from sqlalchemy import Integer, String, Numeric, Date, ForeignKey, Boolean
 import datetime
 import decimal
 from typing import Optional
@@ -39,6 +39,13 @@ class SecurityDB(Base):
     currency: Mapped[str] = mapped_column(String)
     latest_price: Mapped[Optional[decimal.Decimal]] = mapped_column(Numeric(20, 8), nullable=True)
     sector: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # DRIP guard inputs. HarvestIQ can't see broker settings, so the user
+    # declares whether automatic dividend reinvestment is on for this holding
+    # and when the next (or most recent) dividend lands. A DRIP purchase is a
+    # BUY the wash-sale rule counts — the classic "I sold everything, why is
+    # the IRS still saying I broke the rule" trap.
+    drip_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    next_dividend_date: Mapped[Optional[datetime.date]] = mapped_column(Date, nullable=True)
 
 class TaxLotDB(Base):
     __tablename__ = "tax_lots"

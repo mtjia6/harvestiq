@@ -453,3 +453,56 @@ def test_holding_period_uses_calendar_year_not_365_days():
     gains = sorted(client.get("/realized-gains").json(), key=lambda g: g["sell_date"])
     assert gains[0]["term"] == "short"
     assert gains[1]["term"] == "long"
+
+
+# ---------- DRIP guard (feature: dividend reinvestment vs wash sale) ----------
+def set_dividends(symbol, drip, div_date=None):
+    return client.put(f"/securities/{symbol}/dividends", json={
+        "drip_enabled": drip,
+        "next_dividend_date": div_date,
+    })
+
+
+def test_drip_with_upcoming_dividend_warns_turn_it_off_first():
+    add_security("VTI", price=200)
+    buy("VTI", 10, 250, "2026-01-05")              # losing lot, no wash risk
+    soon = (date.today() + timedelta(days=10)).isoformat()
+    assert set_dividends("VTI", True, soon).status_code == 200
+
+    opps = client.get("/harvest-opportunities").json()
+    vti = [o for o in opps if o["symbol"] == "VTI"][0]
+    assert vti["drip_risk"] is True
+    assert "Turn off dividend reinvestment" in vti["drip_warning"]
+    assert vti["recommended"] is True              # fixable -> warn, don't veto
+
+    plan = client.get("/harvest-plan").json()
+    step = [s for s in plan["steps"] if s["symbol"] == "VTI"][0]
+    assert step["drip_risk"] is True               # warning rides the plan too
+
+
+def test_drip_with_recent_past_dividend_warns_already_reinvested():
+    add_security("VTI", price=200)
+    buy("VTI", 10, 250, "2026-01-05")
+    recent = (date.today() - timedelta(days=14)).isoformat()
+    set_dividends("VTI", True, recent)
+
+    opps = client.get("/harvest-opportunities").json()
+    vti = [o for o in opps if o["symbol"] == "VTI"][0]
+    assert vti["drip_risk"] is True
+    assert "was paid" in vti["drip_warning"]
+
+
+def test_no_drip_warning_when_off_or_dividend_far_away():
+    add_security("VTI", price=200)
+    buy("VTI", 10, 250, "2026-01-05")
+
+    # DRIP off, dividend soon -> fine
+    set_dividends("VTI", False, (date.today() + timedelta(days=10)).isoformat())
+    vti = [o for o in client.get("/harvest-opportunities").json() if o["symbol"] == "VTI"][0]
+    assert vti["drip_risk"] is False
+
+    # DRIP on, dividend outside the window -> fine
+    set_dividends("VTI", True, (date.today() + timedelta(days=45)).isoformat())
+    vti = [o for o in client.get("/harvest-opportunities").json() if o["symbol"] == "VTI"][0]
+    assert vti["drip_risk"] is False
+    assert vti["drip_warning"] is None

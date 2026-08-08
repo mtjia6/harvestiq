@@ -212,6 +212,8 @@ class SecurityOut(BaseModel):
     currency: str
     latest_price: Optional[Money] = None
     sector: Optional[str] = None
+    drip_enabled: bool = False
+    next_dividend_date: Optional[date] = None
 
 
 class TaxLotOut(BaseModel):
@@ -667,6 +669,47 @@ def create_security(security: Security, db: Session = Depends(get_db)):
 )
 def get_securities(db: Session = Depends(get_db)):
     return db.query(SecurityDB).all()
+
+
+class DividendSettings(BaseModel):
+    """Per-security DRIP declaration. `next_dividend_date` may be a recent
+    PAST date too — a dividend reinvested days before a sale is exactly the
+    trap this guards against."""
+
+    drip_enabled: bool
+    next_dividend_date: Optional[date] = None
+
+
+@app.put(
+    "/securities/{symbol}/dividends",
+    tags=["Securities"],
+    response_model=SecurityOut,
+    summary="Declare DRIP status and the next dividend date",
+    description=(
+        "HarvestIQ cannot see broker settings, so the user declares whether "
+        "automatic dividend reinvestment (DRIP) is on for this holding and "
+        "when the next dividend lands. When a dividend falls inside the "
+        "±30-day wash-sale window of a proposed harvest, the engine warns: "
+        "turn off reinvestment first, then sell. Re-run "
+        "`POST /tax-analysis/run` after changing."
+    ),
+    responses={404: {"description": "Unknown symbol."}},
+)
+def update_dividend_settings(
+    symbol: str, settings: DividendSettings, db: Session = Depends(get_db)
+):
+    security = (
+        db.query(SecurityDB)
+        .filter(SecurityDB.symbol == symbol)
+        .first()
+    )
+    if security is None:
+        raise HTTPException(status_code=404, detail=f"Unknown symbol: {symbol}")
+    security.drip_enabled = settings.drip_enabled
+    security.next_dividend_date = settings.next_dividend_date
+    db.commit()
+    db.refresh(security)
+    return security
 
 
 class PriceUpdate(BaseModel):

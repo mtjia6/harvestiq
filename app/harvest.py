@@ -219,6 +219,38 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
             # or before this date disallows the harvested loss.
             safe_to_rebuy_after = today + timedelta(days=WASH_SALE_WINDOW_DAYS)
 
+        # DRIP guard: an automatic dividend reinvestment is a BUY the
+        # wash-sale rule counts, and the engine can't stop the broker from
+        # making it. If reinvestment is on and a dividend lands inside the
+        # ±30-day window around a sale today, warn BEFORE recommending the
+        # sale — "I sold everything, why did the IRS still deny my loss?"
+        # is almost always this.
+        drip_risk = False
+        drip_warning = None
+        if (
+            security.asset_class != "crypto"
+            and security.drip_enabled
+            and security.next_dividend_date is not None
+        ):
+            days_away = (security.next_dividend_date - today).days
+            if -WASH_SALE_WINDOW_DAYS <= days_away <= WASH_SALE_WINDOW_DAYS:
+                drip_risk = True
+                if days_away >= 0:
+                    drip_warning = (
+                        f"dividend expected on {security.next_dividend_date} with automatic "
+                        f"reinvestment ON — the reinvestment would count as a purchase inside "
+                        f"the wash-sale window and disallow part of this loss. Turn off "
+                        f"dividend reinvestment for {lot.symbol} first, then sell."
+                    )
+                else:
+                    drip_warning = (
+                        f"a dividend was paid on {security.next_dividend_date} with automatic "
+                        f"reinvestment ON — reinvested shares from it count as a purchase "
+                        f"inside the wash-sale window. Check your broker for the reinvestment "
+                        f"and record it, or wait until {WASH_SALE_WINDOW_DAYS + 1} days after "
+                        f"that date to sell."
+                    )
+
         opportunities.append({
             "lot_id": lot.id,
             "symbol": lot.symbol,
@@ -234,6 +266,11 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
             "wash_sale_risk": wash_sale_risk,
             "wash_sale_reason": wash_sale_reason,
             "safe_to_rebuy_after": safe_to_rebuy_after,
+            "drip_risk": drip_risk,
+            "drip_warning": drip_warning,
+            # DRIP risk doesn't veto the lot — the user can fix it (turn off
+            # reinvestment) and then sell. It's an action-required warning,
+            # unlike wash_sale_risk which reflects purchases already made.
             "recommended": not wash_sale_risk,
         })
 
@@ -398,6 +435,8 @@ def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Dec
             "lot_broker": best["lot_broker"],
             "term": best["term"],
             "unrealized_loss": best["unrealized_loss"],
+            "drip_risk": best["drip_risk"],
+            "drip_warning": best["drip_warning"],
             "step_savings": step_savings,
             "step_carryforward": step_carryforward,
             "cumulative_savings": cumulative_savings,
