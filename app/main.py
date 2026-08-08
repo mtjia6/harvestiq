@@ -26,7 +26,15 @@ import redis.asyncio as aioredis
 from app.database import get_db, SessionLocal
 from app.model import TransactionDB, SecurityDB, TaxLotDB, RealizedGainDB, TaxSettingsDB
 from app.celery_app import celery_app, redis_client, generate_harvest_explanation, run_tax_analysis
-from app.harvest import build_harvest_opportunities, build_harvest_plan, get_ytd_realized_totals, build_portfolio_summary
+from app.harvest import (
+    build_harvest_opportunities,
+    build_harvest_plan,
+    get_ytd_realized_totals,
+    build_portfolio_summary,
+    holding_term,
+    apply_wash_sale_on_sell,
+    apply_wash_sale_on_buy,
+)
 from app import prices
 from app.prices import PriceUnavailable
 
@@ -231,6 +239,7 @@ class RealizedGainOut(BaseModel):
     proceeds: Money
     cost_basis: Money
     gain_loss: Money
+    disallowed_wash_loss: Money
     term: str
     sell_date: date
 
@@ -254,6 +263,11 @@ class Transaction(BaseModel):
     broker: str = Field(min_length=1)
     fees: Decimal = Field(ge=0)
     currency: str = Field(min_length=1)
+    # How a SELL picks its lots (ignored on BUY). Harvesting IS lot selection:
+    # "fifo" is the IRS default; "hifo" sells the highest-basis (biggest-loss)
+    # lots first; "specific" consumes exactly `lot_ids`, in the order given.
+    lot_selection: Literal["fifo", "hifo", "specific"] = "fifo"
+    lot_ids: Optional[List[int]] = None
 
 
 class MarketTransaction(BaseModel):
@@ -263,6 +277,8 @@ class MarketTransaction(BaseModel):
     broker: str = Field(min_length=1)
     fees: Decimal = Field(ge=0)
     currency: str = Field(min_length=1)
+    lot_selection: Literal["fifo", "hifo", "specific"] = "fifo"
+    lot_ids: Optional[List[int]] = None
 
 
 @app.get("/", tags=["Dashboard"], summary="Liveness ping")
@@ -294,20 +310,65 @@ def process_transaction(transaction: Transaction, db: Session):
 
     open_lots = []
     if transaction.transaction_type == "SELL":
-        open_lots = (
-            db.query(TaxLotDB)
-            .filter(TaxLotDB.symbol == transaction.symbol)
-            .filter(TaxLotDB.status == "open")
-            .filter(TaxLotDB.broker == transaction.broker)
-            .order_by(TaxLotDB.opened_date)
-            .all()
-        )
+        if transaction.lot_selection == "specific":
+            # Specific identification: consume exactly the caller's lots, in
+            # the order given. This is what makes a harvest plan executable —
+            # the plan says "sell lot #12" and this actually sells lot #12.
+            if not transaction.lot_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail="lot_selection 'specific' requires lot_ids.",
+                )
+            lots_by_id = {
+                lot.id: lot
+                for lot in db.query(TaxLotDB)
+                .filter(TaxLotDB.id.in_(transaction.lot_ids))
+                .all()
+            }
+            open_lots = []
+            for lot_id in transaction.lot_ids:
+                lot = lots_by_id.get(lot_id)
+                if lot is None:
+                    raise HTTPException(status_code=400, detail=f"Unknown lot id: {lot_id}")
+                if lot.symbol != transaction.symbol:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Lot {lot_id} is {lot.symbol}, not {transaction.symbol}",
+                    )
+                if lot.broker != transaction.broker:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Lot {lot_id} is held at {lot.broker}, not {transaction.broker}",
+                    )
+                if lot.status != "open":
+                    raise HTTPException(status_code=400, detail=f"Lot {lot_id} is not open")
+                open_lots.append(lot)
+        else:
+            query = (
+                db.query(TaxLotDB)
+                .filter(TaxLotDB.symbol == transaction.symbol)
+                .filter(TaxLotDB.status == "open")
+                .filter(TaxLotDB.broker == transaction.broker)
+            )
+            if transaction.lot_selection == "hifo":
+                # Highest cost basis first: realizes the biggest loss (or the
+                # smallest gain) per share sold — the tax-efficient default
+                # for anyone not targeting a specific lot.
+                query = query.order_by(
+                    TaxLotDB.cost_basis_per_unit.desc(), TaxLotDB.opened_date
+                )
+            else:  # fifo — the IRS default
+                query = query.order_by(TaxLotDB.opened_date)
+            open_lots = query.all()
+
         total_available = sum(lot.quantity_remaining for lot in open_lots)
         if total_available < transaction.quantity:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Not enough {transaction.symbol} to sell: have {total_available}, tried {transaction.quantity}",
+            detail = (
+                f"Selected lots hold {total_available} {transaction.symbol}, tried to sell {transaction.quantity}"
+                if transaction.lot_selection == "specific"
+                else f"Not enough {transaction.symbol} to sell: have {total_available}, tried {transaction.quantity}"
             )
+            raise HTTPException(status_code=400, detail=detail)
 
     db_transaction = TransactionDB(
         symbol=transaction.symbol,
@@ -339,9 +400,18 @@ def process_transaction(transaction: Transaction, db: Session):
             status="open",
         )
         db.add(lot)
+        db.flush()
+
+        # Forward half of the wash-sale window: this buy may retroactively
+        # disallow a loss realized within the last 30 days (the new lot is a
+        # replacement — the loss rolls into its basis). Crypto is property,
+        # not a security: exempt.
+        if security.asset_class != "crypto":
+            apply_wash_sale_on_buy(db, transaction.symbol, lot, transaction.trade_date)
 
     if transaction.transaction_type == "SELL":
         quantity_to_sell = transaction.quantity
+        realized_records = []
 
         for lot in open_lots:
             if quantity_to_sell <= 0:
@@ -361,8 +431,8 @@ def process_transaction(transaction: Transaction, db: Session):
             cost_basis = quantity_sold * lot.cost_basis_per_unit
             gain_loss = proceeds - cost_basis
 
-            holding_days = (transaction.trade_date - lot.opened_date).days
-            term = "long" if holding_days > 365 else "short"
+            # Calendar "more than one year" rule, not `days > 365`.
+            term = holding_term(lot.opened_date, transaction.trade_date)
 
             realized = RealizedGainDB(
                 symbol=transaction.symbol,
@@ -372,10 +442,21 @@ def process_transaction(transaction: Transaction, db: Session):
                 proceeds=proceeds,
                 cost_basis=cost_basis,
                 gain_loss=gain_loss,
+                disallowed_wash_loss=Decimal("0"),
                 term=term,
                 sell_date=transaction.trade_date,
             )
             db.add(realized)
+            realized_records.append(realized)
+
+        # Backward half of the wash-sale window: losses just realized are
+        # disallowed to the extent replacement shares (bought in the window,
+        # still held after this sale) exist.
+        if security.asset_class != "crypto":
+            db.flush()
+            apply_wash_sale_on_sell(
+                db, transaction.symbol, transaction.trade_date, realized_records
+            )
 
     db.commit()
     return db_transaction
@@ -388,9 +469,13 @@ def process_transaction(transaction: Transaction, db: Session):
     response_model=TransactionOut,
     summary="Record a buy or sell",
     description=(
-        "A BUY opens a tax lot with fee-inclusive cost basis. A SELL consumes "
-        "open lots FIFO within the same broker and writes a realized gain per "
-        "lot consumed, classified short- or long-term by holding period.\n\n"
+        "A BUY opens a tax lot with fee-inclusive cost basis (and may "
+        "retroactively disallow a recent loss under the wash-sale rule). A "
+        "SELL consumes open lots within the same broker — FIFO by default, "
+        "HIFO, or specific lots via `lot_selection`/`lot_ids` — writing a "
+        "realized gain per lot consumed, classified by the calendar "
+        "more-than-one-year rule, with wash-sale losses disallowed and "
+        "rolled into replacement-lot basis.\n\n"
         "Returns the created transaction, including its id."
     ),
     responses={
@@ -454,6 +539,8 @@ def create_market_transaction(market: MarketTransaction, db: Session = Depends(g
         broker=market.broker,
         fees=market.fees,
         currency=market.currency,
+        lot_selection=market.lot_selection,
+        lot_ids=market.lot_ids,
     )
 
     return process_transaction(transaction, db)
@@ -652,49 +739,35 @@ def get_unrealized_gains(db: Session = Depends(get_db)):
 @app.get(
     "/wash-sales",
     tags=["Tax analysis"],
-    summary="Flag realized losses tainted by a repurchase",
+    summary="Realized losses and their wash-sale disallowance",
     description=(
-        "Checks each realized loss for a purchase of the same symbol inside the "
-        "±30-day window. Crypto is exempt (treated as property, not a security). "
-        "Matching is same-symbol only, not 'substantially identical'."
+        "Reads the ENFORCED wash-sale records: `disallowed_loss` is the "
+        "portion actually disallowed (rolled into replacement-lot basis) by "
+        "the transaction engine; `allowed_loss` is what counts for taxes. "
+        "Crypto is exempt (property, not a security). Matching is "
+        "same-symbol only, not 'substantially identical'."
     ),
 )
 def get_wash_sales(db: Session = Depends(get_db)):
+    # A wash-sale-adjusted loss can have gain_loss == 0 (fully disallowed),
+    # so select on the ECONOMIC loss (cost basis > proceeds), not gain_loss.
     losses = (
         db.query(RealizedGainDB)
-        .filter(RealizedGainDB.gain_loss < 0)
+        .filter(RealizedGainDB.cost_basis > RealizedGainDB.proceeds)
         .all()
     )
 
     results = []
     for loss in losses:
-        security = (
-            db.query(SecurityDB)
-            .filter(SecurityDB.symbol == loss.symbol)
-            .first()
-        )
-        is_crypto = security is not None and security.asset_class == "crypto"
-
-        replacement = None
-        if not is_crypto:
-            window_start = loss.sell_date - timedelta(days=30)
-            window_end = loss.sell_date + timedelta(days=30)
-            replacement = (
-                db.query(TransactionDB)
-                .filter(TransactionDB.symbol == loss.symbol)
-                .filter(TransactionDB.transaction_type == "BUY")
-                .filter(TransactionDB.trade_date >= window_start)
-                .filter(TransactionDB.trade_date <= window_end)
-                .first()
-            )
-
+        economic_loss = loss.proceeds - loss.cost_basis  # negative
         results.append({
             "realized_gain_id": loss.id,
             "symbol": loss.symbol,
             "sell_date": loss.sell_date,
-            "loss_amount": loss.gain_loss,
-            "wash_sale": replacement is not None,
-            "triggering_buy_id": replacement.id if replacement else None,
+            "loss_amount": economic_loss,
+            "wash_sale": loss.disallowed_wash_loss > 0,
+            "disallowed_loss": loss.disallowed_wash_loss,
+            "allowed_loss": loss.gain_loss,
         })
 
     return results

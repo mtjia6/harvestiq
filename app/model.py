@@ -52,6 +52,11 @@ class TaxLotDB(Base):
     cost_basis_per_unit: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
     opened_date: Mapped[datetime.date] = mapped_column(Date)
     status: Mapped[str] = mapped_column(String)
+    # Shares of this lot already claimed as wash-sale replacement shares, so
+    # the same shares can't absorb two different disallowed losses.
+    wash_replacement_used: Mapped[decimal.Decimal] = mapped_column(
+        Numeric(20, 8), default=decimal.Decimal("0")
+    )
 
 class RealizedGainDB(Base):
     __tablename__ = "realized_gains"
@@ -63,7 +68,13 @@ class RealizedGainDB(Base):
     quantity_sold: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
     proceeds: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
     cost_basis: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
+    # gain_loss is the TAX-REPORTABLE figure (post wash-sale disallowance).
+    # The economic result is gain_loss - disallowed_wash_loss; the disallowed
+    # portion lives on in the replacement lot's adjusted basis.
     gain_loss: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
+    disallowed_wash_loss: Mapped[decimal.Decimal] = mapped_column(
+        Numeric(20, 8), default=decimal.Decimal("0")
+    )
     term: Mapped[str] = mapped_column(String)
     sell_date: Mapped[datetime.date] = mapped_column(Date)
 

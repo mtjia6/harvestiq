@@ -6,6 +6,25 @@ from decimal import Decimal
 # $3,000 per year (IRC §1211(b)). Anything beyond it carries forward.
 ANNUAL_ORDINARY_LOSS_LIMIT = Decimal("3000")
 
+# The wash-sale window: 30 days before AND after the sale (61 days total).
+WASH_SALE_WINDOW_DAYS = 30
+
+
+def holding_term(opened_date, as_of):
+    """IRS holding-period rule: LONG-term means held MORE than one year,
+    measured on the calendar, not as `days > 365`.
+
+    A lot bought Feb 1, 2025 and sold Feb 1, 2026 is exactly one year —
+    still SHORT-term; Feb 2 is the first long-term day. The day-count
+    version also misclassifies a whole day of boundary cases across leap
+    years. (Feb 29 purchases use Feb 28 as the anniversary.)
+    """
+    try:
+        anniversary = opened_date.replace(year=opened_date.year + 1)
+    except ValueError:  # Feb 29 in a leap year
+        anniversary = opened_date.replace(year=opened_date.year + 1, day=28)
+    return "long" if as_of > anniversary else "short"
+
 
 def net_capital_position(net_st, net_lt):
     """Apply the IRS netting waterfall to net short-term and long-term figures.
@@ -138,6 +157,17 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
     securities_by_symbol = {s.symbol: s for s in db.query(SecurityDB).all()}
     net_st, net_lt = get_effective_net_position(db)
 
+    # ONE query for every symbol's window buys (kills the old per-lot N+1).
+    window_start = today - timedelta(days=WASH_SALE_WINDOW_DAYS)
+    window_buys_by_symbol = {}
+    for tx in (
+        db.query(TransactionDB)
+        .filter(TransactionDB.transaction_type == "BUY")
+        .filter(TransactionDB.trade_date >= window_start)
+        .all()
+    ):
+        window_buys_by_symbol.setdefault(tx.symbol, []).append(tx)
+
     for lot in open_lots:
         security = securities_by_symbol.get(lot.symbol)
         if security is None or security.latest_price is None:
@@ -150,11 +180,7 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
         if unrealized >= 0:
             continue
 
-        holding_days = (today - lot.opened_date).days
-        if holding_days > 365:
-            term = "long"
-        else:
-            term = "short"
+        term = holding_term(lot.opened_date, today)
 
         estimated_tax_savings, carryforward_generated = marginal_harvest_value(
             -unrealized, term, net_st, net_lt, short_term_rate, long_term_rate
@@ -164,20 +190,34 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
         if security.asset_class == "crypto":
             wash_sale_risk = False
             wash_sale_reason = None
+            safe_to_rebuy_after = None
         else:
-            window_start = today - timedelta(days=30)
-            recent_buy = (
-                db.query(TransactionDB)
-                .filter(TransactionDB.symbol == lot.symbol)
-                .filter(TransactionDB.transaction_type == "BUY")
-                .filter(TransactionDB.trade_date >= window_start)
-                .first()
+            # A wash sale needs REPLACEMENT shares: shares bought inside the
+            # window that you'd still hold AFTER the sale. If this lot itself
+            # is the recent buy and the sale liquidates it entirely, nothing
+            # is "washed" — the old any-recent-buy check wrongly vetoed
+            # exactly those sharp fresh-drawdown lots, a harvester's best
+            # candidates.
+            window_buys = window_buys_by_symbol.get(lot.symbol, [])
+            window_buy_qty = sum((tx.quantity for tx in window_buys), Decimal("0"))
+            own_window_qty = (
+                lot.quantity_remaining if lot.opened_date >= window_start else Decimal("0")
             )
-            wash_sale_risk = recent_buy is not None
-            wash_sale_reason = (
-                f"you bought {lot.symbol} on {recent_buy.trade_date}, within the last 30 days"
-                if recent_buy else None
-            )
+            replacement_qty = window_buy_qty - own_window_qty
+
+            wash_sale_risk = replacement_qty > 0
+            if wash_sale_risk:
+                buy_dates = ", ".join(str(tx.trade_date) for tx in window_buys)
+                wash_sale_reason = (
+                    f"{replacement_qty.normalize()} shares of {lot.symbol} bought within the last "
+                    f"{WASH_SALE_WINDOW_DAYS} days (on {buy_dates}) would remain after this sale, "
+                    f"so the loss would be disallowed against them"
+                )
+            else:
+                wash_sale_reason = None
+            # Selling today starts the forward half of the window: a rebuy on
+            # or before this date disallows the harvested loss.
+            safe_to_rebuy_after = today + timedelta(days=WASH_SALE_WINDOW_DAYS)
 
         opportunities.append({
             "lot_id": lot.id,
@@ -193,6 +233,7 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
             "carryforward_generated": carryforward_generated,
             "wash_sale_risk": wash_sale_risk,
             "wash_sale_reason": wash_sale_reason,
+            "safe_to_rebuy_after": safe_to_rebuy_after,
             "recommended": not wash_sale_risk,
         })
 
@@ -203,6 +244,88 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
         reverse=True,
     )
     return opportunities
+
+
+def _transfer_disallowed_loss(db, realized, replacement_lot, sell_date):
+    """Move as much of `realized`'s not-yet-disallowed loss as `replacement_lot`
+    can absorb. Implements the two legs of IRC §1091:
+
+      - the loss is DISALLOWED for tax purposes (realized.gain_loss moves
+        toward zero; the amount is recorded in disallowed_wash_loss), and
+      - it doesn't vanish: it's added to the replacement lot's basis, and the
+        replacement's holding period is tacked back by the sold lot's holding
+        period, so the deferred loss keeps its seniority.
+
+    Simplification (documented): the basis bump and the tacked date are
+    spread across the replacement lot's remaining shares rather than
+    splitting the lot. Total basis is exactly right; per-share attribution
+    is approximate when a lot is only partially a replacement.
+    """
+    economic_loss = realized.cost_basis - realized.proceeds  # positive = loss
+    remaining = economic_loss - realized.disallowed_wash_loss
+    capacity = replacement_lot.quantity_remaining - replacement_lot.wash_replacement_used
+    if remaining <= 0 or capacity <= 0:
+        return Decimal("0")
+
+    per_share_loss = economic_loss / realized.quantity_sold
+    shares = min(remaining / per_share_loss, capacity)
+    amount = shares * per_share_loss
+
+    realized.disallowed_wash_loss += amount
+    realized.gain_loss += amount  # gain_loss is the TAX-reportable figure
+
+    replacement_lot.cost_basis_per_unit += amount / replacement_lot.quantity_remaining
+    replacement_lot.wash_replacement_used += shares
+
+    # Holding-period tacking: the replacement inherits the sold shares' age.
+    loss_lot = db.query(TaxLotDB).filter(TaxLotDB.id == realized.lot_id).first()
+    if loss_lot is not None:
+        held = sell_date - loss_lot.opened_date
+        replacement_lot.opened_date = replacement_lot.opened_date - held
+
+    return amount
+
+
+def apply_wash_sale_on_sell(db, symbol, sell_date, realized_records):
+    """After a SELL: disallow losses to the extent replacement shares (bought
+    inside the ±30-day window, still held after the sale) exist right now."""
+    window_start = sell_date - timedelta(days=WASH_SALE_WINDOW_DAYS)
+    window_end = sell_date + timedelta(days=WASH_SALE_WINDOW_DAYS)
+    replacement_lots = (
+        db.query(TaxLotDB)
+        .filter(TaxLotDB.symbol == symbol)
+        .filter(TaxLotDB.status == "open")
+        .filter(TaxLotDB.opened_date >= window_start)
+        .filter(TaxLotDB.opened_date <= window_end)
+        .order_by(TaxLotDB.opened_date)
+        .all()
+    )
+    for realized in realized_records:
+        if realized.cost_basis <= realized.proceeds:
+            continue  # not a loss
+        for lot in replacement_lots:
+            _transfer_disallowed_loss(db, realized, lot, sell_date)
+
+
+def apply_wash_sale_on_buy(db, symbol, new_lot, buy_date):
+    """After a BUY: the forward half of the window. A purchase within 30 days
+    of an earlier realized loss makes the new lot a replacement — the loss is
+    retroactively disallowed and rolled into this lot's basis. (Without this
+    hook, only sell-time detection would run and the books would drift from
+    what the IRS computes.)"""
+    window_start = buy_date - timedelta(days=WASH_SALE_WINDOW_DAYS)
+    window_end = buy_date + timedelta(days=WASH_SALE_WINDOW_DAYS)
+    losses = (
+        db.query(RealizedGainDB)
+        .filter(RealizedGainDB.symbol == symbol)
+        .filter(RealizedGainDB.sell_date >= window_start)
+        .filter(RealizedGainDB.sell_date <= window_end)
+        .filter(RealizedGainDB.cost_basis > RealizedGainDB.proceeds)
+        .order_by(RealizedGainDB.sell_date)
+        .all()
+    )
+    for realized in losses:
+        _transfer_disallowed_loss(db, realized, new_lot, realized.sell_date)
 
 
 def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Decimal("0")):

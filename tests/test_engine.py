@@ -306,9 +306,150 @@ def test_plan_excludes_wash_sale_risky_lots():
     add_security("GAIN", price=90)
     buy("GAIN", 100, 50, "2026-01-05")
     sell("GAIN", 100, 90, "2026-02-01")            # gains, so losses have value
+    # TWO recent buys: selling either lot leaves the other's shares as
+    # replacement shares -> both are genuine wash-sale risks.
     add_security("FRESH", price=60)
-    buy("FRESH", 10, 100, date.today().isoformat())  # bought today -> wash risk
+    buy("FRESH", 10, 100, date.today().isoformat())
+    buy("FRESH", 5, 100, date.today().isoformat())
 
     plan = client.get("/harvest-plan").json()
     assert all(s["symbol"] != "FRESH" for s in plan["steps"])
-    assert [e["symbol"] for e in plan["excluded_wash_sale"]] == ["FRESH"]
+    assert {e["symbol"] for e in plan["excluded_wash_sale"]} == {"FRESH"}
+
+
+# ---------- wash-sale correctness (fix #3) ----------
+from datetime import timedelta
+
+def test_full_liquidation_of_recent_buy_is_not_wash_risky():
+    # THE OLD FALSE POSITIVE: a lot bought 2 weeks ago that immediately
+    # dropped is a harvester's best candidate. Selling ALL of it leaves no
+    # replacement shares -> no wash sale -> must be recommended.
+    add_security("NVDA", price=85)
+    two_weeks_ago = (date.today() - timedelta(days=14)).isoformat()
+    buy("NVDA", 10, 100, two_weeks_ago)
+    opps = client.get("/harvest-opportunities").json()
+    nvda = [o for o in opps if o["symbol"] == "NVDA"][0]
+    assert nvda["wash_sale_risk"] is False
+    assert nvda["recommended"] is True
+    assert nvda["safe_to_rebuy_after"] is not None
+
+
+def test_remaining_window_shares_still_flag_wash_risk():
+    # An OLDER losing lot, plus a fresh buy of the same symbol that the sale
+    # would NOT liquidate -> those fresh shares are replacement shares.
+    add_security("AAPL", price=80)
+    buy("AAPL", 10, 150, "2026-01-05")                       # old losing lot
+    buy("AAPL", 5, 82, (date.today() - timedelta(days=10)).isoformat())
+    opps = client.get("/harvest-opportunities").json()
+    old_lot = [o for o in opps if float(o["unrealized_loss"]) == pytest.approx(-700)][0]
+    assert old_lot["wash_sale_risk"] is True
+    assert "5 shares" in old_lot["wash_sale_reason"]
+
+
+def test_buy_side_wash_sale_disallows_and_adjusts_basis():
+    # Sell at a loss, rebuy 14 days later: the loss is disallowed and rolls
+    # into the new lot's basis; the holding period tacks back.
+    add_security("AAPL")
+    buy("AAPL", 10, 200, "2026-01-01")
+    sell("AAPL", 10, 150, "2026-02-01")            # $500 economic loss
+    buy("AAPL", 10, 150, "2026-02-15")             # replacement purchase
+
+    gains = client.get("/realized-gains").json()
+    assert float(gains[0]["gain_loss"]) == pytest.approx(0)          # allowed: none
+    assert float(gains[0]["disallowed_wash_loss"]) == pytest.approx(500)
+
+    lots = [l for l in client.get("/tax-lots").json() if l["status"] == "open"]
+    assert len(lots) == 1
+    # $150 purchase + $500/10 disallowed loss = $200/share adjusted basis
+    assert float(lots[0]["cost_basis_per_unit"]) == pytest.approx(200)
+    # Tacking: opened Feb 15 minus the 31 days the old lot was held = Jan 15
+    assert lots[0]["opened_date"] == "2026-01-15"
+
+
+def test_sell_side_wash_sale_partial_disallowance():
+    # 100 shares bought long ago at $100; 50 more bought 9 days before the
+    # sale at $90. Selling the OLD 100 at $80 realizes a $2,000 loss, but 50
+    # replacement shares exist -> half the loss (50 sh x $20) is disallowed.
+    add_security("MSFT", price=80)
+    buy("MSFT", 100, 100, "2026-01-05")
+    buy("MSFT", 50, 90, "2026-02-20")
+    sell("MSFT", 100, 80, "2026-03-01")            # FIFO -> consumes the old lot
+
+    gains = client.get("/realized-gains").json()
+    assert float(gains[0]["gain_loss"]) == pytest.approx(-1000)      # allowed half
+    assert float(gains[0]["disallowed_wash_loss"]) == pytest.approx(1000)
+
+    lots = [l for l in client.get("/tax-lots").json() if l["status"] == "open"]
+    assert len(lots) == 1
+    # $90 basis + $1,000 spread over 50 shares = $110/share
+    assert float(lots[0]["cost_basis_per_unit"]) == pytest.approx(110)
+
+    washes = client.get("/wash-sales").json()
+    assert washes[0]["wash_sale"] is True
+    assert float(washes[0]["disallowed_loss"]) == pytest.approx(1000)
+    assert float(washes[0]["allowed_loss"]) == pytest.approx(-1000)
+
+
+# ---------- lot selection (fix #4) ----------
+def test_hifo_sells_highest_basis_lot_first():
+    add_security("AAPL")
+    buy("AAPL", 10, 150, "2026-01-05")
+    buy("AAPL", 10, 180, "2026-03-02")
+    r = client.post("/transactions", json={
+        "symbol": "AAPL", "quantity": 10, "price": 160,
+        "transaction_type": "SELL", "trade_date": "2026-06-01",
+        "broker": "test", "fees": 0, "currency": "USD",
+        "lot_selection": "hifo",
+    })
+    assert r.status_code == 201
+    lots = {l["opened_date"]: l for l in client.get("/tax-lots").json()}
+    assert lots["2026-03-02"]["status"] == "closed"                  # $180 lot sold
+    assert float(lots["2026-01-05"]["quantity_remaining"]) == pytest.approx(10)
+    gains = client.get("/realized-gains").json()
+    assert float(gains[0]["gain_loss"]) == pytest.approx(-200)       # (160-180) x 10
+
+
+def test_specific_lot_sale_targets_exactly_that_lot():
+    add_security("AAPL")
+    buy("AAPL", 10, 150, "2026-01-05")
+    buy("AAPL", 10, 180, "2026-03-02")
+    lots = client.get("/tax-lots").json()
+    target = [l for l in lots if l["opened_date"] == "2026-03-02"][0]
+    r = client.post("/transactions", json={
+        "symbol": "AAPL", "quantity": 10, "price": 160,
+        "transaction_type": "SELL", "trade_date": "2026-06-01",
+        "broker": "test", "fees": 0, "currency": "USD",
+        "lot_selection": "specific", "lot_ids": [target["id"]],
+    })
+    assert r.status_code == 201
+    lots = {l["opened_date"]: l for l in client.get("/tax-lots").json()}
+    assert lots["2026-03-02"]["status"] == "closed"
+    assert float(lots["2026-01-05"]["quantity_remaining"]) == pytest.approx(10)
+
+
+def test_specific_lot_sale_validates_lot():
+    add_security("AAPL")
+    buy("AAPL", 10, 150, "2026-01-05")
+    base = {
+        "symbol": "AAPL", "quantity": 5, "price": 160,
+        "transaction_type": "SELL", "trade_date": "2026-06-01",
+        "broker": "test", "fees": 0, "currency": "USD",
+        "lot_selection": "specific",
+    }
+    assert client.post("/transactions", json=base).status_code == 400            # no lot_ids
+    assert client.post("/transactions", json={**base, "lot_ids": [9999]}).status_code == 400
+    lot_id = client.get("/tax-lots").json()[0]["id"]
+    r = client.post("/transactions", json={**base, "lot_ids": [lot_id], "broker": "other"})
+    assert r.status_code == 400                                                  # wrong broker
+
+
+def test_holding_period_uses_calendar_year_not_365_days():
+    add_security("AAPL")
+    # Bought Feb 1, 2025. Sold exactly on the first anniversary: SHORT.
+    buy("AAPL", 10, 100, "2025-02-01")
+    sell("AAPL", 5, 120, "2026-02-01")
+    # Sold the day after the anniversary: LONG.
+    sell("AAPL", 5, 120, "2026-02-02")
+    gains = sorted(client.get("/realized-gains").json(), key=lambda g: g["sell_date"])
+    assert gains[0]["term"] == "short"
+    assert gains[1]["term"] == "long"
