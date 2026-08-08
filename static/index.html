@@ -180,6 +180,22 @@
     </div>
   </div>
 
+  <!-- WALLETS & TRANSFERS -->
+  <div class="card">
+    <h2>Wallets &amp; Transfers</h2>
+    <div class="disclaimer" style="margin:0 0 8px;">A transfer moves lots between your wallets carrying cost basis and holding period with them — it is not a sale, nothing is realized. Sells always draw only from the wallet they happen in (per-wallet basis, Rev. Proc. 2024-28).</div>
+    <div id="acctList" class="extra-list" style="margin-bottom:12px;">Loading…</div>
+    <div class="controls">
+      <div><label>Symbol</label><select id="xferSymbol"></select></div>
+      <div><label>Qty</label><input id="xferQty" type="number" step="any" min="0"></div>
+      <div><label>From</label><select id="xferFrom"></select></div>
+      <div><label>To</label><input id="xferTo" list="acctNames" placeholder="wallet name"><datalist id="acctNames"></datalist></div>
+      <div><label>Date</label><input id="xferDate" type="date"></div>
+      <button class="small" onclick="doTransfer()">Transfer</button>
+    </div>
+    <div class="saved-note" id="xferSaved"></div>
+  </div>
+
   <!-- PRICE CHART -->
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -523,6 +539,45 @@ async function recordExternalBuy() {
   }
 }
 
+async function loadAccounts() {
+  const res = await fetch('/accounts');
+  if (!res.ok) return;
+  const accts = await res.json();
+  document.getElementById('acctList').innerHTML = accts.length
+    ? 'Your wallets: ' + accts.map(a => `<strong>${esc(a.name)}</strong> <span class="muted">(${esc(a.kind)})</span>`).join(' · ')
+    : 'No wallets yet — they appear automatically when you record a transaction.';
+  document.getElementById('xferFrom').innerHTML =
+    accts.map(a => `<option value="${esc(a.name)}">${esc(a.name)}</option>`).join('');
+  document.getElementById('acctNames').innerHTML =
+    accts.map(a => `<option value="${esc(a.name)}">`).join('');
+}
+
+async function doTransfer() {
+  const qty = document.getElementById('xferQty').value;
+  const to = document.getElementById('xferTo').value.trim();
+  const dt = document.getElementById('xferDate').value;
+  if (!qty || !to || !dt) { flash('xferSaved', 'Qty, destination and date required'); return; }
+  const res = await fetch('/transfers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      symbol: document.getElementById('xferSymbol').value,
+      quantity: qty,
+      from_account: document.getElementById('xferFrom').value,
+      to_account: to,
+      transfer_date: dt,
+    }),
+  });
+  if (res.ok) {
+    document.getElementById('xferQty').value = '';
+    flash('xferSaved', 'Transferred — basis and holding period moved with it.');
+    recomputeTax();
+  } else {
+    const err = await res.json().catch(() => ({}));
+    flash('xferSaved', err.detail || 'Transfer failed');
+  }
+}
+
 function showDripFor() {
   const sym = document.getElementById('dripSymbol').value;
   const sec = securitiesCache.find(s => s.symbol === sym);
@@ -560,6 +615,7 @@ async function loadSecurities() {
   if (hadChart) chartSel.value = hadChart;
   document.getElementById('dripSymbol').innerHTML = opts;
   document.getElementById('extSymbol').innerHTML = opts;
+  document.getElementById('xferSymbol').innerHTML = opts;
   showDripFor();
   if (securitiesCache.length && !priceChart) loadChart();
 }
@@ -668,7 +724,7 @@ async function recomputeTax() {
   setTimeout(reloadAll, 1500);
 }
 
-function reloadAll() { loadSummary(); loadPlan(); loadPortfolio(); loadOpportunities(); loadRealized(); loadExternalAccounts(); }
+function reloadAll() { loadSummary(); loadPlan(); loadPortfolio(); loadOpportunities(); loadRealized(); loadExternalAccounts(); loadAccounts(); }
 reloadAll();
 loadSecurities();
 loadTaxSettings();

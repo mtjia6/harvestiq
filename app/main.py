@@ -32,6 +32,8 @@ from app.model import (
     TaxSettingsDB,
     ExternalAccountDB,
     ExternalActivityDB,
+    AccountDB,
+    TransferDB,
 )
 from app.celery_app import celery_app, redis_client, generate_harvest_explanation, run_tax_analysis
 from app.harvest import (
@@ -311,7 +313,21 @@ def dashboard():
     return FileResponse("static/index.html")
 
 
+def get_or_create_account(db, name, kind="unknown"):
+    """Every broker/wallet name lives in the accounts registry. Auto-created
+    on first use so historical data and existing clients keep working; the
+    dashboard offers the registry as a picker so typos don't silently mint
+    new wallets."""
+    account = db.query(AccountDB).filter(AccountDB.name == name).first()
+    if account is None:
+        account = AccountDB(name=name, kind=kind)
+        db.add(account)
+        db.flush()
+    return account
+
+
 def process_transaction(transaction: Transaction, db: Session):
+    get_or_create_account(db, transaction.broker)
     security = (
         db.query(SecurityDB)
         .filter(SecurityDB.symbol == transaction.symbol)
@@ -834,6 +850,194 @@ def get_wash_sales(db: Session = Depends(get_db)):
         })
 
     return results
+
+
+class AccountIn(BaseModel):
+    name: str = Field(min_length=1)
+    kind: Literal["brokerage", "exchange", "wallet", "unknown"] = "unknown"
+
+
+class AccountOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    kind: str
+
+
+class TransferIn(BaseModel):
+    symbol: str = Field(min_length=1)
+    quantity: Decimal = Field(gt=0)
+    from_account: str = Field(min_length=1)
+    to_account: str = Field(min_length=1)
+    transfer_date: date
+    # Which lots move: FIFO by default, or exactly these lot ids.
+    lot_ids: Optional[List[int]] = None
+
+
+class TransferOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    symbol: str
+    quantity: Money
+    from_account: str
+    to_account: str
+    transfer_date: date
+
+
+@app.post(
+    "/accounts",
+    tags=["Wallets"],
+    status_code=status.HTTP_201_CREATED,
+    response_model=AccountOut,
+    summary="Register a wallet/account",
+    description=(
+        "Optional — accounts are auto-registered the first time a broker "
+        "name appears on a transaction. Pre-registering lets you set the "
+        "kind (brokerage / exchange / wallet) and gives the UI a clean "
+        "picker so typos don't mint phantom wallets."
+    ),
+    responses={409: {"description": "An account with this name already exists."}},
+)
+def create_account(payload: AccountIn, db: Session = Depends(get_db)):
+    existing = db.query(AccountDB).filter(AccountDB.name == payload.name).first()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail=f"Account already exists: {payload.name}")
+    account = AccountDB(name=payload.name, kind=payload.kind)
+    db.add(account)
+    db.commit()
+    db.refresh(account)
+    return account
+
+
+@app.get(
+    "/accounts",
+    tags=["Wallets"],
+    response_model=List[AccountOut],
+    summary="List wallets/accounts we hold lots in",
+)
+def get_accounts(db: Session = Depends(get_db)):
+    return db.query(AccountDB).all()
+
+
+@app.post(
+    "/transfers",
+    tags=["Wallets"],
+    status_code=status.HTTP_201_CREATED,
+    response_model=TransferOut,
+    summary="Move holdings between wallets, carrying basis with them",
+    description=(
+        "A transfer is NOT a disposal: no gain or loss is realized. Lots "
+        "move to the destination account keeping their cost basis, "
+        "acquisition date, and (wash-adjusted) holding-period date — the "
+        "recordkeeping a blockchain transaction doesn't do for you, and "
+        "what Rev. Proc. 2024-28's per-wallet basis rules require. FIFO "
+        "from the source account by default, or pass `lot_ids` to move "
+        "specific lots. Partial moves split the lot."
+    ),
+    responses={400: {"description": "Unknown symbol/lots, same account, or not enough held."}},
+)
+def create_transfer(payload: TransferIn, db: Session = Depends(get_db)):
+    if payload.from_account == payload.to_account:
+        raise HTTPException(status_code=400, detail="from_account and to_account are the same")
+
+    security = (
+        db.query(SecurityDB)
+        .filter(SecurityDB.symbol == payload.symbol)
+        .first()
+    )
+    if security is None:
+        raise HTTPException(status_code=400, detail=f"Unknown symbol: {payload.symbol}")
+
+    get_or_create_account(db, payload.from_account)
+    get_or_create_account(db, payload.to_account)
+
+    if payload.lot_ids:
+        lots_by_id = {
+            lot.id: lot
+            for lot in db.query(TaxLotDB).filter(TaxLotDB.id.in_(payload.lot_ids)).all()
+        }
+        source_lots = []
+        for lot_id in payload.lot_ids:
+            lot = lots_by_id.get(lot_id)
+            if lot is None or lot.status != "open" or lot.symbol != payload.symbol \
+                    or lot.broker != payload.from_account:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Lot {lot_id} is not an open {payload.symbol} lot in {payload.from_account}",
+                )
+            source_lots.append(lot)
+    else:
+        source_lots = (
+            db.query(TaxLotDB)
+            .filter(TaxLotDB.symbol == payload.symbol)
+            .filter(TaxLotDB.status == "open")
+            .filter(TaxLotDB.broker == payload.from_account)
+            .order_by(TaxLotDB.opened_date)
+            .all()
+        )
+
+    available = sum((lot.quantity_remaining for lot in source_lots), Decimal("0"))
+    if available < payload.quantity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only {available} {payload.symbol} held in {payload.from_account}, tried to move {payload.quantity}",
+        )
+
+    to_move = payload.quantity
+    for lot in source_lots:
+        if to_move <= 0:
+            break
+        if lot.quantity_remaining <= to_move:
+            # Whole lot re-homes: basis, dates, and wash bookkeeping ride along.
+            to_move -= lot.quantity_remaining
+            lot.broker = payload.to_account
+        else:
+            # Partial: split. The moved shares keep basis, the REAL purchase
+            # date, the (possibly tacked) holding date, and a proportional
+            # share of any wash-replacement usage.
+            fraction = to_move / lot.quantity_remaining
+            moved_used = (lot.wash_replacement_used * fraction).quantize(Decimal("0.00000001"))
+            moved = TaxLotDB(
+                symbol=lot.symbol,
+                open_transaction_id=lot.open_transaction_id,
+                quantity_opened=to_move,
+                quantity_remaining=to_move,
+                broker=payload.to_account,
+                cost_basis_per_unit=lot.cost_basis_per_unit,
+                opened_date=lot.opened_date,
+                holding_period_date=lot.holding_period_date,
+                status="open",
+                wash_replacement_used=moved_used,
+            )
+            db.add(moved)
+            lot.quantity_remaining -= to_move
+            lot.quantity_opened -= to_move
+            lot.wash_replacement_used -= moved_used
+            to_move = Decimal("0")
+
+    transfer = TransferDB(
+        symbol=payload.symbol,
+        quantity=payload.quantity,
+        from_account=payload.from_account,
+        to_account=payload.to_account,
+        transfer_date=payload.transfer_date,
+    )
+    db.add(transfer)
+    db.commit()
+    db.refresh(transfer)
+    return transfer
+
+
+@app.get(
+    "/transfers",
+    tags=["Wallets"],
+    response_model=List[TransferOut],
+    summary="List inter-wallet transfers",
+)
+def get_transfers(db: Session = Depends(get_db)):
+    return db.query(TransferDB).all()
 
 
 class ExternalAccountIn(BaseModel):

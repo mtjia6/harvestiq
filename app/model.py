@@ -97,6 +97,42 @@ class RealizedGainDB(Base):
     sell_date: Mapped[datetime.date] = mapped_column(Date)
 
 
+class AccountDB(Base):
+    """A wallet/account WE manage lots in — brokerage account, exchange
+    account, or self-custody crypto wallet. `transactions.broker` and
+    `tax_lots.broker` strings are names in this registry (auto-created on
+    first use so historical data keeps working).
+
+    This is what makes per-wallet cost basis (Rev. Proc. 2024-28) explicit:
+    a sale in one account can only consume that account's lots — which the
+    broker-scoped sell logic enforces — and moving assets between wallets
+    is a TRANSFER that carries basis with it, never a disposal.
+
+    Not to be confused with ExternalAccountDB: those are WATCH-ONLY (other
+    people's brokers we only observe purchases in, for cross-account wash
+    detection). These are ours.
+    """
+    __tablename__ = "accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String, unique=True)
+    # brokerage / exchange / wallet / unknown (auto-created)
+    kind: Mapped[str] = mapped_column(String, default="unknown")
+
+
+class TransferDB(Base):
+    """Audit record of an inter-wallet transfer. The lot mutations (re-homed
+    or split lots) are the substance; this row is the paper trail."""
+    __tablename__ = "transfers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String)
+    quantity: Mapped[decimal.Decimal] = mapped_column(Numeric(20, 8))
+    from_account: Mapped[str] = mapped_column(String)
+    to_account: Mapped[str] = mapped_column(String)
+    transfer_date: Mapped[datetime.date] = mapped_column(Date)
+
+
 # Account types where a wash-sale replacement purchase PERMANENTLY destroys
 # the loss (Rev. Rul. 2008-5): there is no basis to adjust in a tax-advantaged
 # account, so the disallowed loss can never come back.

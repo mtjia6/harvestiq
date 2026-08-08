@@ -834,3 +834,81 @@ def test_spent_replacement_shares_dont_block_the_next_harvest():
                  and float(o["unrealized_loss"]) == pytest.approx(-400)][0]
     assert lot_b_opp["wash_sale_risk"] is False
     assert lot_b_opp["recommended"] is True
+
+
+# ---------- multi-wallet: accounts registry + transfers ----------
+def transfer(symbol, qty, frm, to, day, lot_ids=None):
+    body = {"symbol": symbol, "quantity": qty, "from_account": frm,
+            "to_account": to, "transfer_date": day}
+    if lot_ids:
+        body["lot_ids"] = lot_ids
+    return client.post("/transfers", json=body)
+
+
+def test_accounts_auto_register_from_transactions():
+    add_security("AAPL")
+    buy("AAPL", 10, 100, "2026-01-05")             # broker "test"
+    names = [a["name"] for a in client.get("/accounts").json()]
+    assert "test" in names
+
+
+def test_whole_lot_transfer_rehomes_with_basis_and_dates():
+    add_security("BTC-USD", asset_class="crypto", sector="crypto")
+    buy("BTC-USD", 2, 30000, "2025-03-01", fees=100)   # basis 30050/unit, broker "test"
+    r = transfer("BTC-USD", 2, "test", "cold-wallet", "2026-08-01")
+    assert r.status_code == 201
+
+    lots = client.get("/tax-lots").json()
+    assert len(lots) == 1                              # re-homed, not duplicated
+    lot = lots[0]
+    assert lot["broker"] == "cold-wallet"
+    assert float(lot["cost_basis_per_unit"]) == pytest.approx(30050)
+    assert lot["opened_date"] == "2025-03-01"          # acquisition date rides along
+    # Not a disposal: nothing realized.
+    assert client.get("/realized-gains").json() == []
+
+
+def test_partial_transfer_splits_lot_preserving_basis():
+    add_security("BTC-USD", asset_class="crypto", sector="crypto")
+    buy("BTC-USD", 2, 30000, "2025-03-01")
+    r = transfer("BTC-USD", 0.5, "test", "cold-wallet", "2026-08-01")
+    assert r.status_code == 201
+
+    lots = {l["broker"]: l for l in client.get("/tax-lots").json()}
+    assert float(lots["cold-wallet"]["quantity_remaining"]) == pytest.approx(0.5)
+    assert float(lots["test"]["quantity_remaining"]) == pytest.approx(1.5)
+    for l in lots.values():
+        assert float(l["cost_basis_per_unit"]) == pytest.approx(30000)
+        assert l["opened_date"] == "2025-03-01"
+
+
+def test_sell_after_transfer_uses_destination_wallet_basis_only():
+    # The Rev. Proc. 2024-28 point: after moving 1 BTC to the cold wallet,
+    # a sale AT the exchange can only draw on what's still at the exchange —
+    # and a sale from the cold wallet uses the transferred basis.
+    add_security("BTC-USD", asset_class="crypto", sector="crypto")
+    buy("BTC-USD", 1, 30000, "2025-03-01")                 # exchange ("test")
+    transfer("BTC-USD", 1, "test", "cold-wallet", "2026-07-01")
+
+    # Nothing left at the exchange to sell:
+    r = sell("BTC-USD", 1, 40000, "2026-08-01")            # broker "test"
+    assert r.status_code == 400
+
+    # Selling from the cold wallet realizes against the carried basis:
+    r = client.post("/transactions", json={
+        "symbol": "BTC-USD", "quantity": 1, "price": 40000,
+        "transaction_type": "SELL", "trade_date": "2026-08-01",
+        "broker": "cold-wallet", "fees": 0, "currency": "USD",
+    })
+    assert r.status_code == 201
+    gains = client.get("/realized-gains").json()
+    assert float(gains[0]["gain_loss"]) == pytest.approx(10000)   # 40000 - 30000
+    assert gains[0]["term"] == "long"                             # held since 2025-03-01
+
+
+def test_transfer_validations():
+    add_security("AAPL")
+    buy("AAPL", 10, 100, "2026-01-05")
+    assert transfer("AAPL", 5, "test", "test", "2026-08-01").status_code == 400   # same wallet
+    assert transfer("AAPL", 50, "test", "other", "2026-08-01").status_code == 400 # not enough
+    assert transfer("FAKE", 1, "test", "other", "2026-08-01").status_code == 400  # unknown symbol
