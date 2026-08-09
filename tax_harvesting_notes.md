@@ -74,3 +74,6 @@ estimated_tax_savings = -unrealized * tax_rate   # tax_rate depends on that lot'
 ```
 
 This assumes every loss fully applies at its own term's rate — it does **not** check your actual year-to-date realized gains (`RealizedGainDB` exists but isn't queried here) and doesn't run the real netting waterfall from #8. So today's "estimated tax savings" is a per-position ballpark, not a true "given everything else this year, here's what this loss is actually worth" figure. Documented as a known gap, not yet fixed.
+
+
+Harvesting is only worth it if you actually have gains to offset — if you're in a low bracket, sitting on big loss carryforwards, or have no realized gains coming, you're deferring taxes into a future you may not benefit from. And harvesting isn't free: it's a deferral, not an erasure. Your basis drops, so the tax comes due when you eventually sell, unless the position gets stepped up at death or donated. It also pushes your portfolio to drift from the index you're tracking. Their figures are gross of management fees, which for a direct-indexing SMA can eat a meaningful chunk of that 1%.

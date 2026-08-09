@@ -1,4 +1,5 @@
 from datetime import date
+from app.harvest import SEASONING_WARNING_DAYS
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -923,6 +924,109 @@ def test_portfolio_summary_carries_the_capacity_headline():
     assert float(summary["harvest_capacity_blocked"]) == pytest.approx(0)
     # Capacity is the pool; useful_loss_budget is this year's slice of it.
     assert float(summary["useful_loss_budget"]) == pytest.approx(3000)
+
+
+# ---------- seasoning deadline (short-term loss about to go long) ----------
+def _lot_aged(days_before_anniversary, symbol="SEAS", price=60, basis=100, qty=100):
+    # A lot whose one-year anniversary is `days_before_anniversary` away.
+    opened = date.today() - timedelta(days=365 - days_before_anniversary)
+    add_security(symbol, price=price)
+    buy(symbol, qty, basis, opened.isoformat())
+    return opened
+
+
+def _st_and_lt_gains():
+    # BOTH characters of gain on the books. This is what makes seasoning
+    # cost anything: a loss cancels gain of its own character first, so a
+    # short-term loss kills 37% gain while a long-term one only reaches the
+    # 15% pile. With only ST gain present a long-term loss just cross-nets
+    # into it at the short rate and character is worth nothing.
+    add_security("STG", price=150)
+    buy("STG", 100, 50, "2026-01-05")
+    sell("STG", 100, 150, "2026-02-01")            # +$10,000 ST gain
+    add_security("LTG", price=150)
+    buy("LTG", 100, 50, "2024-01-05")
+    sell("LTG", 100, 150, "2026-02-01")            # +$10,000 LT gain
+
+
+def test_seasoning_warns_inside_thirty_days_of_the_anniversary():
+    _st_and_lt_gains()
+    opened = _lot_aged(10)                          # -$4,000, 10 days left
+    opps = client.get("/harvest-opportunities?short_term_rate=0.37&long_term_rate=0.15").json()
+    lot = [o for o in opps if o["symbol"] == "SEAS"][0]
+
+    assert lot["term"] == "short"
+    assert lot["seasoning_risk"] is True
+    assert lot["seasoning_days_remaining"] == 10
+    assert lot["seasoning_deadline"] == opened.replace(year=opened.year + 1).isoformat()
+    # $4,000 at 37% short vs 15% long.
+    assert float(lot["seasoning_savings_at_risk"]) == pytest.approx(4000 * (0.37 - 0.15))
+
+
+def test_seasoning_is_quiet_when_waiting_costs_nothing():
+    # No short-term gains, so the loss lands on the $3,000 ordinary slice
+    # either way and character buys nothing. A deadline that costs $0 is
+    # not a warning.
+    _lot_aged(10)
+    opps = client.get("/harvest-opportunities?short_term_rate=0.37&long_term_rate=0.37").json()
+    lot = [o for o in opps if o["symbol"] == "SEAS"][0]
+
+    assert lot["seasoning_days_remaining"] == 10    # deadline still reported
+    assert float(lot["seasoning_savings_at_risk"]) == pytest.approx(0)
+    assert lot["seasoning_risk"] is False           # but no alarm
+
+
+def test_seasoning_is_silent_outside_the_window_and_once_long():
+    _lot_aged(90, symbol="FAR")                     # 90 days out
+    opened_long = date.today() - timedelta(days=400)
+    add_security("OLD", price=60)
+    buy("OLD", 100, 100, opened_long.isoformat())   # already long-term
+
+    opps = client.get("/harvest-opportunities").json()
+    by_symbol = {o["symbol"]: o for o in opps}
+
+    assert by_symbol["FAR"]["seasoning_risk"] is False
+    assert by_symbol["FAR"]["seasoning_deadline"] is None
+    assert by_symbol["OLD"]["term"] == "long"
+    assert by_symbol["OLD"]["seasoning_deadline"] is None
+
+
+def test_seasoning_uses_the_tacked_holding_date_not_the_buy_date():
+    # A wash sale tacks the sold shares' age onto the replacement lot, so
+    # the deadline must follow holding_period_date. Buying 3 days ago looks
+    # like 362 days of runway; after tacking a nearly-year-old lot onto it,
+    # the anniversary is days away.
+    add_security("WASH", price=60)
+    old = (date.today() - timedelta(days=360)).isoformat()
+    buy("WASH", 100, 100, old)                      # lot A, nearly seasoned
+    recent = (date.today() - timedelta(days=3)).isoformat()
+    buy("WASH", 100, 62, recent)                    # lot W, replacement shares
+
+    lots = client.get("/tax-lots").json()
+    lot_a = [l for l in lots if l["opened_date"] == old][0]
+    r = client.post("/transactions", json={
+        "symbol": "WASH", "quantity": 100, "price": 60,
+        "transaction_type": "SELL", "trade_date": date.today().isoformat(),
+        "broker": "test", "fees": 0, "currency": "USD",
+        "lot_selection": "specific", "lot_ids": [lot_a["id"]],
+    })
+    assert r.status_code == 201
+
+    opps = client.get("/harvest-opportunities").json()
+    washed = [o for o in opps if o["symbol"] == "WASH"][0]
+    # Tacked back to lot A's age, so the anniversary is close, not a year off.
+    assert washed["seasoning_days_remaining"] is not None
+    assert washed["seasoning_days_remaining"] <= SEASONING_WARNING_DAYS
+
+
+def test_plan_steps_and_carryforward_only_carry_the_deadline():
+    _st_and_lt_gains()
+    _lot_aged(5)                                    # -$4,000, 5 days left
+
+    plan = client.get("/harvest-plan?short_term_rate=0.37&long_term_rate=0.15").json()
+    step = [s for s in plan["steps"] if s["symbol"] == "SEAS"][0]
+    assert step["seasoning_risk"] is True
+    assert step["seasoning_days_remaining"] == 5
 
 
 # ---------- spent replacement shares (review fix 4) ----------

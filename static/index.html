@@ -392,9 +392,27 @@ async function loadCapacity() {
 }
 
 // ---------- HARVEST PLAN ----------
+// A short-term loss that crosses its anniversary becomes long-term and is
+// usually worth less. Only shown when waiting actually costs money.
+function seasoningTitle(s) {
+  const d = Number(s.seasoning_days_remaining);
+  const when = d === 0 ? 'today is the last short-term day'
+    : d === 1 ? 'last short-term day is tomorrow'
+    : `${d} days left`;
+  return `Short-term until ${s.seasoning_deadline} (${when}). Harvesting after that `
+    + `makes it a long-term loss, worth about ${money(s.seasoning_savings_at_risk)} less.`;
+}
+
+function seasoningBadge(s) {
+  if (!s.seasoning_risk) return '';
+  return ` <span class="badge caution" title="${esc(seasoningTitle(s))}">`
+    + `${Number(s.seasoning_days_remaining)}d TO LONG-TERM</span>`;
+}
+
 function stepBadges(s) {
   let b = '';
   if (s.drip_risk) b += ` <span class="badge caution" title="${esc(s.drip_warning)}">DRIP</span>`;
+  b += seasoningBadge(s);
   return b;
 }
 
@@ -450,6 +468,7 @@ async function loadPlan() {
     extras += `<div style="margin-top:10px;"><strong>Carryforward only</strong> — selling these adds $0 this year (deferral only): `
       + plan.carryforward_only.map(c =>
           `${esc(c.symbol)} lot #${c.lot_id} (${money(c.unrealized_loss)} → banks ${money(c.carryforward_if_harvested)})`
+          + seasoningBadge(c)
         ).join(' · ')
       + `</div>`;
   }
@@ -526,7 +545,9 @@ async function loadPortfolio() {
 }
 
 function oppStatus(o) {
-  if (o.recommended && !o.drip_risk) return '<span class="badge ok">Recommended</span>';
+  if (o.recommended && !o.drip_risk && !o.seasoning_risk) {
+    return '<span class="badge ok">Recommended</span>';
+  }
   let out = [];
   if (o.wash_sale_risk) {
     const label = o.wash_sale_permanent ? 'PERMANENT wash risk' : 'Wash-sale risk';
@@ -535,6 +556,7 @@ function oppStatus(o) {
     out.push('<span class="badge ok">Recommended</span>');
   }
   if (o.drip_risk) out.push(`<span class="badge caution" title="${esc(o.drip_warning)}">DRIP</span>`);
+  if (o.seasoning_risk) out.push(seasoningBadge(o).trim());
   return out.join(' ');
 }
 

@@ -18,6 +18,22 @@ ANNUAL_ORDINARY_LOSS_LIMIT = Decimal("3000")
 # The wash-sale window: 30 days before AND after the sale (61 days total).
 WASH_SALE_WINDOW_DAYS = 30
 
+# How close to a lot's one-year anniversary counts as "decide now". A short-
+# term loss that crosses into long-term is usually worth LESS (it stops being
+# available to offset short-term gains and the ordinary-income slice), and
+# unlike most timing questions this one has a hard, known deadline.
+SEASONING_WARNING_DAYS = 30
+
+
+def holding_period_anniversary(opened_date):
+    """The last day a sale is still SHORT-term. Sell on this date and the
+    holding period is exactly one year; the next day is the first long-term
+    day. (Feb 29 purchases use Feb 28 as the anniversary.)"""
+    try:
+        return opened_date.replace(year=opened_date.year + 1)
+    except ValueError:  # Feb 29 in a leap year
+        return opened_date.replace(year=opened_date.year + 1, day=28)
+
 
 def holding_term(opened_date, as_of):
     """IRS holding-period rule: LONG-term means held MORE than one year,
@@ -26,13 +42,9 @@ def holding_term(opened_date, as_of):
     A lot bought Feb 1, 2025 and sold Feb 1, 2026 is exactly one year —
     still SHORT-term; Feb 2 is the first long-term day. The day-count
     version also misclassifies a whole day of boundary cases across leap
-    years. (Feb 29 purchases use Feb 28 as the anniversary.)
+    years.
     """
-    try:
-        anniversary = opened_date.replace(year=opened_date.year + 1)
-    except ValueError:  # Feb 29 in a leap year
-        anniversary = opened_date.replace(year=opened_date.year + 1, day=28)
-    return "long" if as_of > anniversary else "short"
+    return "long" if as_of > holding_period_anniversary(opened_date) else "short"
 
 
 def net_capital_position(net_st, net_lt):
@@ -365,6 +377,31 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
                         f"that date to sell."
                     )
 
+        # Seasoning deadline: this lot's loss is short-term today and will
+        # be long-term after its anniversary. Character is not free — a
+        # short-term loss offsets short-term gains (and the ordinary slice)
+        # first, so letting it season can cost real money. Rather than warn
+        # generically, price it: re-run the same loss as if it were already
+        # long-term and report the difference. If waiting costs nothing —
+        # no short-term gains to shelter, or the rates are equal — there is
+        # no warning, because there is no problem.
+        seasoning_deadline = None
+        seasoning_days_remaining = None
+        seasoning_savings_at_risk = None
+        seasoning_risk = False
+        if term == "short":
+            anniversary = holding_period_anniversary(effective_holding_date(lot))
+            days_remaining = (anniversary - today).days
+            if 0 <= days_remaining <= SEASONING_WARNING_DAYS:
+                savings_if_long, _ = marginal_harvest_value(
+                    -unrealized, "long", net_st, net_lt, short_term_rate, long_term_rate
+                )
+                at_risk = estimated_tax_savings - savings_if_long
+                seasoning_deadline = anniversary
+                seasoning_days_remaining = days_remaining
+                seasoning_savings_at_risk = at_risk
+                seasoning_risk = at_risk > 0
+
         opportunities.append({
             "lot_id": lot.id,
             "symbol": lot.symbol,
@@ -386,6 +423,10 @@ def build_harvest_opportunities(db, short_term_rate, long_term_rate):
             "safe_to_rebuy_after": safe_to_rebuy_after,
             "drip_risk": drip_risk,
             "drip_warning": drip_warning,
+            "seasoning_deadline": seasoning_deadline,
+            "seasoning_days_remaining": seasoning_days_remaining,
+            "seasoning_savings_at_risk": seasoning_savings_at_risk,
+            "seasoning_risk": seasoning_risk,
             # DRIP risk doesn't veto the lot — the user can fix it (turn off
             # reinvestment) and then sell. It's an action-required warning,
             # unlike wash_sale_risk which reflects purchases already made.
@@ -750,6 +791,10 @@ def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Dec
             "loss_harvested": -sized_loss,
             "drip_risk": best["drip_risk"],
             "drip_warning": best["drip_warning"],
+            "seasoning_deadline": best["seasoning_deadline"],
+            "seasoning_days_remaining": best["seasoning_days_remaining"],
+            "seasoning_savings_at_risk": best["seasoning_savings_at_risk"],
+            "seasoning_risk": best["seasoning_risk"],
             "step_savings": step_savings,
             "step_carryforward": step_carryforward,
             "step_future_tax_cost": step_deferral["future_tax_cost"],
@@ -773,6 +818,13 @@ def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Dec
             "term": o["term"],
             "unrealized_loss": o["unrealized_loss"],
             "carryforward_if_harvested": carry,
+            # Deferring a lot past its anniversary is the one deferral with
+            # a hard deadline, so it matters MORE here than in the steps:
+            # these are exactly the lots being left for next year.
+            "seasoning_deadline": o["seasoning_deadline"],
+            "seasoning_days_remaining": o["seasoning_days_remaining"],
+            "seasoning_savings_at_risk": o["seasoning_savings_at_risk"],
+            "seasoning_risk": o["seasoning_risk"],
         })
 
     total_deferral = deferral_math(
