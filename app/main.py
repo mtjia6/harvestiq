@@ -38,6 +38,7 @@ from app.model import (
 from app.celery_app import celery_app, redis_client, generate_harvest_explanation, run_tax_analysis
 from app.harvest import (
     build_harvest_opportunities,
+    build_harvest_capacity,
     build_harvest_plan,
     get_ytd_realized_totals,
     build_portfolio_summary,
@@ -1287,6 +1288,36 @@ def get_harvest_plan(
     db: Session = Depends(get_db),
 ):
     return build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings)
+
+
+@app.get(
+    "/harvest-capacity",
+    tags=["Tax analysis"],
+    summary="How much harvestable loss is left, and how far prices must fall",
+    description=(
+        "The remaining POOL of unrealized loss, which is a different question "
+        "from what to harvest this year. `/harvest-plan` is capped by the "
+        "useful-loss budget and the carryforward dial; this endpoint ignores "
+        "both and reports what is actually there.\n\n"
+        "Harvesting spends the pool permanently — the replacement lot's basis "
+        "resets down, so the loss does not come back. Only new contributions "
+        "refill it.\n\n"
+        "Per position, `drawdown_to_harvest` is the fraction the price must "
+        "FALL before that position's highest-basis lot goes underwater. `0` "
+        "means something is harvestable now; `0.30` means the position offers "
+        "nothing until a 30% drawdown.\n\n"
+        "Losses on wash-sale-blocked lots are counted in "
+        "`total_harvestable_loss` but excluded from `available_now` — they are "
+        "unavailable today, not gone."
+    ),
+)
+def get_harvest_capacity(
+    short_term_rate: RateQuery = SHORT_TERM_TAX_RATE,
+    long_term_rate: RateQuery = LONG_TERM_TAX_RATE,
+    db: Session = Depends(get_db),
+):
+    opportunities = build_harvest_opportunities(db, short_term_rate, long_term_rate)
+    return build_harvest_capacity(db, opportunities)
 
 
 @app.post(

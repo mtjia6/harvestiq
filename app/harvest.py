@@ -794,6 +794,107 @@ def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Dec
     }
 
 
+def build_harvest_capacity(db, opportunities, open_lots=None, securities_by_symbol=None):
+    """How much harvestable loss is LEFT — the stock, not this year's flow.
+
+    Every other number in this engine answers "what should I sell today".
+    This one answers "how much is there still to sell, ever". They diverge
+    badly: `harvestable_recommended_loss` is capped by the useful-loss
+    budget and the carryforward dial, so an account holding $80k of
+    unrealized loss can report $4k of recommended harvest and look nearly
+    tapped out when it isn't — or report $4k for the tenth year running
+    while the underlying pool quietly empties.
+
+    Harvesting spends this pool permanently: the replacement lot's basis
+    resets to today's lower price, so the loss leaves the pool and does not
+    come back. Only new contributions refill it. Nothing in the engine
+    tracks that, which is what makes the pool worth reporting on its own.
+
+    `drawdown_to_harvest` is the same fact from the other side: the
+    fraction the price must FALL before the highest-basis lot in a position
+    goes underwater. Zero means something is harvestable right now. A
+    position sitting at 0.30 is ossified — it needs a 30% drawdown before
+    it offers anything at all.
+
+    `open_lots` / `securities_by_symbol` may be passed in by a caller that
+    has already loaded them (see `build_portfolio_summary`) to avoid
+    re-querying on the websocket push path.
+    """
+    if open_lots is None:
+        open_lots = db.query(TaxLotDB).filter(TaxLotDB.status == "open").all()
+    if securities_by_symbol is None:
+        securities_by_symbol = {s.symbol: s for s in db.query(SecurityDB).all()}
+
+    # A lot the opportunity list declined to recommend is blocked, not gone:
+    # the loss is still in the pool, it just can't be taken today.
+    blocked_lot_ids = {o["lot_id"] for o in opportunities if not o["recommended"]}
+
+    positions = {}
+    total_loss = Decimal("0")
+    blocked_loss = Decimal("0")
+    priced_market_value = Decimal("0")
+
+    for lot in open_lots:
+        security = securities_by_symbol.get(lot.symbol)
+        if security is None or security.latest_price is None:
+            continue  # unpriced lots can't be assessed either way
+
+        price = security.latest_price
+        market_value = lot.quantity_remaining * price
+        unrealized = market_value - lot.quantity_remaining * lot.cost_basis_per_unit
+        priced_market_value += market_value
+
+        pos = positions.setdefault(lot.symbol, {
+            "symbol": lot.symbol,
+            "asset_class": security.asset_class,
+            "price": price,
+            "market_value": Decimal("0"),
+            "harvestable_loss": Decimal("0"),
+            "blocked_loss": Decimal("0"),
+            "highest_cost_basis_per_unit": lot.cost_basis_per_unit,
+            "lots_total": 0,
+            "lots_underwater": 0,
+        })
+        pos["market_value"] += market_value
+        pos["lots_total"] += 1
+        if lot.cost_basis_per_unit > pos["highest_cost_basis_per_unit"]:
+            pos["highest_cost_basis_per_unit"] = lot.cost_basis_per_unit
+
+        if unrealized < 0:
+            loss = -unrealized
+            pos["lots_underwater"] += 1
+            pos["harvestable_loss"] += loss
+            total_loss += loss
+            if lot.id in blocked_lot_ids:
+                pos["blocked_loss"] += loss
+                blocked_loss += loss
+
+    for pos in positions.values():
+        # The HIGHEST-basis lot is the first to go underwater, so it sets
+        # the threshold for the whole position.
+        highest = pos["highest_cost_basis_per_unit"]
+        price = pos["price"]
+        pos["drawdown_to_harvest"] = (
+            Decimal("0") if price <= 0 or highest >= price
+            else ((price - highest) / price).quantize(Decimal("0.0001"))
+        )
+        pos["available_loss"] = pos["harvestable_loss"] - pos["blocked_loss"]
+
+    return {
+        "total_harvestable_loss": total_loss,
+        "available_now": total_loss - blocked_loss,
+        "blocked_by_wash_sale": blocked_loss,
+        "capacity_pct_of_market_value": (
+            (total_loss / priced_market_value).quantize(Decimal("0.0001"))
+            if priced_market_value > 0 else Decimal("0")
+        ),
+        "positions": sorted(
+            positions.values(),
+            key=lambda p: (-p["harvestable_loss"], p["drawdown_to_harvest"], p["symbol"]),
+        ),
+    }
+
+
 def build_portfolio_summary(db, opportunities, plan=None):
     # Pure computation of the dashboard summary. `opportunities` is the cached
     # harvest list (already parsed from Redis by the caller); this function does
@@ -846,6 +947,13 @@ def build_portfolio_summary(db, opportunities, plan=None):
     # already pushed the year past the cap, the budget is genuinely zero.
     useful_loss_budget = max(effective_total + ANNUAL_ORDINARY_LOSS_LIMIT, Decimal("0"))
 
+    # Headline capacity only — the per-position detail is heavier than the
+    # websocket push needs, and lives on GET /harvest-capacity. Lots and
+    # securities are handed over so this costs no extra queries.
+    capacity = build_harvest_capacity(
+        db, opportunities, open_lots=open_lots, securities_by_symbol=securities_by_symbol
+    )
+
     return {
         "total_market_value": total_market_value,
         "total_cost_basis": total_cost_basis,
@@ -862,6 +970,12 @@ def build_portfolio_summary(db, opportunities, plan=None):
         "harvestable_recommended_savings": harvestable_savings,
         "harvestable_net_benefit": harvestable_net,  # None until a plan is cached
         "useful_loss_budget": useful_loss_budget,
+        # The remaining pool, NOT this year's recommendation. See
+        # build_harvest_capacity for why these are different numbers.
+        "harvest_capacity_total": capacity["total_harvestable_loss"],
+        "harvest_capacity_available": capacity["available_now"],
+        "harvest_capacity_blocked": capacity["blocked_by_wash_sale"],
+        "harvest_capacity_pct_of_market_value": capacity["capacity_pct_of_market_value"],
     }
 
 

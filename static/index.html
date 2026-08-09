@@ -64,7 +64,7 @@
   }
 
   /* stat tiles */
-  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
   .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px; box-shadow: 0 1px 2px rgba(22,19,15,.04); }
   .stat .label { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
   .stat .value { font-family: var(--serif); font-weight: 600; font-size: 30px; letter-spacing: -.01em; margin-top: 6px; }
@@ -155,8 +155,14 @@
       <div class="value pos" id="s_savings">—</div>
       <div class="subvalue" id="s_net"></div>
     </div>
+    <div class="stat">
+      <div class="label">Harvest Capacity Left</div>
+      <div class="value" id="s_capacity">—</div>
+      <div class="subvalue" id="s_capacitySub"></div>
+    </div>
   </div>
   <div class="disclaimer" id="budgetLine"></div>
+  <div class="disclaimer" id="capacityLine"></div>
 
   <!-- CONTROLS -->
   <div class="card" style="margin-top:20px;">
@@ -332,6 +338,15 @@ function renderSummary(s) {
     (s.harvestable_net_benefit !== null && s.harvestable_net_benefit !== undefined)
       ? `net after future tax ≈ ${money(s.harvestable_net_benefit)}`
       : '';
+  // Capacity is the POOL of unrealized loss left, not this year's plan.
+  // Harvesting spends it permanently (the replacement lot's basis resets
+  // down); only new contributions refill it.
+  document.getElementById('s_capacity').textContent = money(s.harvest_capacity_total);
+  const blocked = Number(s.harvest_capacity_blocked || 0);
+  const capPct = Number(s.harvest_capacity_pct_of_market_value || 0);
+  document.getElementById('s_capacitySub').textContent =
+    `${(capPct * 100).toFixed(1)}% of portfolio`
+    + (blocked > 0 ? ` · ${money(blocked)} wash-blocked` : '');
   const carryIn = Number(s.carryforward_short || 0) + Number(s.carryforward_long || 0);
   document.getElementById('budgetLine').textContent =
     `Useful loss budget this year ≈ ${money(s.useful_loss_budget)}`
@@ -346,6 +361,34 @@ function renderSummary(s) {
 async function loadSummary() {
   const res = await fetch(`/portfolio-summary?${rates()}`);
   renderSummary(await res.json());
+}
+
+// ---------- HARVEST CAPACITY ----------
+// The headline number rides along on the summary (and the websocket push).
+// This adds the per-position half: how far each position must FALL before
+// it offers anything. Positions with a large drawdown are ossified — their
+// basis has been ratcheted down until only a big drop makes them useful.
+async function loadCapacity() {
+  const line = document.getElementById('capacityLine');
+  const res = await fetch(`/harvest-capacity?${rates()}`);
+  if (!res.ok) { line.textContent = ''; return; }
+  const cap = await res.json();
+
+  const dry = cap.positions
+    .filter(p => Number(p.drawdown_to_harvest) > 0)
+    .sort((a, b) => Number(b.drawdown_to_harvest) - Number(a.drawdown_to_harvest))
+    .slice(0, 3);
+
+  if (!dry.length) {
+    line.textContent = cap.positions.length
+      ? 'Every position has at least one lot underwater — nothing is ossified yet.'
+      : '';
+    return;
+  }
+  const parts = dry.map(p =>
+    `${esc(p.symbol)} needs a ${(Number(p.drawdown_to_harvest) * 100).toFixed(0)}% fall`);
+  line.textContent = 'Furthest from harvestable: ' + parts.join(', ')
+    + '. Harvesting spends this pool permanently — only new contributions refill it.';
 }
 
 // ---------- HARVEST PLAN ----------
@@ -808,7 +851,7 @@ async function recomputeTax() {
   setTimeout(reloadAll, 1500);
 }
 
-function reloadAll() { loadSummary(); loadPlan(); loadPortfolio(); loadOpportunities(); loadRealized(); loadExternalAccounts(); loadAccounts(); }
+function reloadAll() { loadSummary(); loadCapacity(); loadPlan(); loadPortfolio(); loadOpportunities(); loadRealized(); loadExternalAccounts(); loadAccounts(); }
 reloadAll();
 loadSecurities();
 loadTaxSettings();

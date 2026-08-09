@@ -842,6 +842,89 @@ def test_dial_sizing_is_monotone_across_the_range():
     assert sized[2] == pytest.approx(4000 + 36000 * 0.75)
 
 
+# ---------- harvest capacity (the remaining pool) ----------
+def test_capacity_reports_the_whole_pool_not_this_years_budget():
+    # No gains, so the plan can only use $3,000 (the ordinary cap) of a
+    # $40,000 lot. Capacity must still report all $40,000 — the point of
+    # the metric is what's LEFT, not what's usable this year.
+    add_security("LOTB", price=100)
+    buy("LOTB", 100, 500, "2026-01-05")            # -$40,000
+
+    plan = client.get("/harvest-plan?short_term_rate=0.37&long_term_rate=0.15").json()
+    assert float(plan["total_harvest_loss"]) == pytest.approx(3000)
+
+    cap = client.get("/harvest-capacity").json()
+    assert float(cap["total_harvestable_loss"]) == pytest.approx(40000)
+    assert float(cap["available_now"]) == pytest.approx(40000)
+    assert float(cap["blocked_by_wash_sale"]) == pytest.approx(0)
+
+
+def test_drawdown_to_harvest_measures_ossification():
+    # WINNER is 50% above its basis: nothing to harvest until a 50% fall.
+    # LOSER is already underwater, so its drawdown is zero.
+    add_security("WINNER", price=100)
+    buy("WINNER", 10, 50, "2026-01-05")            # +$500, basis 50
+    add_security("LOSER", price=60)
+    buy("LOSER", 100, 100, "2026-01-05")           # -$4,000
+
+    cap = client.get("/harvest-capacity").json()
+    by_symbol = {p["symbol"]: p for p in cap["positions"]}
+
+    assert float(by_symbol["WINNER"]["drawdown_to_harvest"]) == pytest.approx(0.5)
+    assert float(by_symbol["WINNER"]["harvestable_loss"]) == pytest.approx(0)
+    assert by_symbol["WINNER"]["lots_underwater"] == 0
+
+    assert float(by_symbol["LOSER"]["drawdown_to_harvest"]) == pytest.approx(0)
+    assert float(by_symbol["LOSER"]["harvestable_loss"]) == pytest.approx(4000)
+    assert by_symbol["LOSER"]["lots_underwater"] == 1
+
+    # $4,000 of loss against $7,000 of priced market value.
+    assert float(cap["capacity_pct_of_market_value"]) == pytest.approx(0.5714, abs=1e-4)
+
+
+def test_capacity_counts_wash_blocked_loss_as_present_but_unavailable():
+    # Lot A is blocked by recent replacement shares. Its loss hasn't gone
+    # anywhere — it's in the pool, just not takeable today.
+    add_security("XOM", price=60)
+    buy("XOM", 10, 100, "2026-01-05")              # lot A: -$400, blocked
+    recent = (date.today() - timedelta(days=5)).isoformat()
+    buy("XOM", 10, 62, recent)                     # lot W: -$20, harvestable
+
+    cap = client.get("/harvest-capacity").json()
+    assert float(cap["total_harvestable_loss"]) == pytest.approx(420)
+    assert float(cap["blocked_by_wash_sale"]) == pytest.approx(400)
+    assert float(cap["available_now"]) == pytest.approx(20)
+
+    pos = cap["positions"][0]
+    assert pos["symbol"] == "XOM"
+    assert pos["lots_underwater"] == 2
+    assert float(pos["available_loss"]) == pytest.approx(20)
+    # Highest basis is lot A's $100, already above the $60 price.
+    assert float(pos["drawdown_to_harvest"]) == pytest.approx(0)
+
+
+def test_portfolio_summary_carries_the_capacity_headline():
+    # The dashboard reads these off the summary (and the websocket push),
+    # so they must survive the summary path, not just the endpoint.
+    from app.harvest import build_portfolio_summary
+
+    add_security("LOTB", price=100)
+    buy("LOTB", 100, 500, "2026-01-05")            # -$40,000
+
+    opportunities = client.get("/harvest-opportunities").json()
+    db = TestingSessionLocal()
+    try:
+        summary = build_portfolio_summary(db, opportunities)
+    finally:
+        db.close()
+
+    assert float(summary["harvest_capacity_total"]) == pytest.approx(40000)
+    assert float(summary["harvest_capacity_available"]) == pytest.approx(40000)
+    assert float(summary["harvest_capacity_blocked"]) == pytest.approx(0)
+    # Capacity is the pool; useful_loss_budget is this year's slice of it.
+    assert float(summary["useful_loss_budget"]) == pytest.approx(3000)
+
+
 # ---------- spent replacement shares (review fix 4) ----------
 def test_spent_replacement_shares_dont_block_the_next_harvest():
     # Harvest one lot; its loss is fully absorbed by a recent 10-share buy.
