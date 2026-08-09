@@ -606,6 +606,28 @@ def apply_external_wash_on_activity(db, activity, account):
         _disallow_against_external(db, realized, activity, account)
 
 
+def _size_harvest(full_loss, budget, carryforward_discount):
+    """How much of a losing lot to actually sell.
+
+    `budget` is the loss that still produces current-year benefit. Beyond
+    it every dollar is pure carryforward, which the user prices at
+    `carryforward_discount` (0 = worthless, 1 = face value). Sizing is
+    linear in that dial:
+
+        sized = budget + (full_loss - budget) x discount
+
+    so discount 0 stops at the budget, 1 takes the whole lot, and every
+    value between spends a proportionate slice of the excess. Lots already
+    inside the budget are always taken whole.
+    """
+    if full_loss <= budget or carryforward_discount >= 1:
+        return full_loss
+    if carryforward_discount <= 0:
+        return budget
+    sized = budget + (full_loss - budget) * carryforward_discount
+    return min(sized.quantize(Decimal("0.01")), full_loss)
+
+
 def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Decimal("0")):
     """An ORDERED, executable harvest plan — the portfolio-level answer.
 
@@ -626,13 +648,15 @@ def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Dec
         score = current_year_savings + (future_rate x carryforward_discount)
                                         x carryforward_generated
 
-    carryforward_discount is the user's strategic dial (see tax_settings):
-    at 0 the plan refuses to spend unrealized loss past the current-year
-    cap — candidates are SIZED to the remaining useful-loss budget, so the
-    right answer to "a $40k-loss lot when only $4k still does anything" is
-    a partial sell of exactly $4k, never the whole lot. At 1 (big gain
-    coming), carryforward is priced near face value and the plan banks
-    whole lots. Ties prefer spending less unrealized loss, then whole-lot
+    carryforward_discount is the user's strategic dial (see tax_settings),
+    and it moves BOTH the score above and the sell size (`_size_harvest`)
+    continuously. At 0 the plan refuses to spend unrealized loss past the
+    current-year cap — candidates are SIZED to the remaining useful-loss
+    budget, so the right answer to "a $40k-loss lot when only $4k still
+    does anything" is a partial sell of exactly $4k, never the whole lot.
+    At 1 (big gain coming), carryforward is priced at face value and the
+    plan banks whole lots. At 0.3 it takes the budget plus 30% of the
+    excess. Ties prefer spending less unrealized loss, then whole-lot
     sells over partial ones (simpler to execute).
 
     Stops when the best remaining score <= `min_step_savings`. Lots past
@@ -642,7 +666,8 @@ def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Dec
     candidates = build_harvest_opportunities(db, short_term_rate, long_term_rate)
     net_st, net_lt = get_effective_net_position(db)
     future_rate = get_expected_future_rate(db, long_term_rate)
-    carryforward_price = future_rate * get_carryforward_discount(db)
+    carryforward_discount = get_carryforward_discount(db)
+    carryforward_price = future_rate * carryforward_discount
 
     remaining = [o for o in candidates if o["recommended"]]
     excluded_wash_sale = [
@@ -667,9 +692,15 @@ def build_harvest_plan(db, short_term_rate, long_term_rate, min_step_savings=Dec
         best_calc = None
         for o in remaining:
             full_loss = -Decimal(str(o["unrealized_loss"]))
-            # Size the harvest: with carryforward priced at zero, selling
-            # beyond the budget spends scarce unrealized loss for nothing.
-            sized_loss = full_loss if carryforward_price > 0 else min(full_loss, budget)
+            # Size the harvest. Loss up to `budget` earns current-year
+            # savings; everything past it becomes carryforward, which the
+            # user prices at `carryforward_discount` (0..1). So the dial
+            # moves the sell size CONTINUOUSLY between those two ends:
+            # 0 -> stop at the budget, 1 -> take the whole lot, 0.3 -> take
+            # the budget plus 30% of the excess. Sizing on the discount
+            # (not carryforward_price, which is a tax RATE) keeps the
+            # endpoints exactly where the docstring claims they are.
+            sized_loss = _size_harvest(full_loss, budget, carryforward_discount)
             if sized_loss <= 0:
                 continue
             savings, carry = marginal_harvest_value(

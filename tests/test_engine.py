@@ -799,6 +799,49 @@ def test_bank_everything_mode_harvests_whole_lots():
     assert plan["carryforward_only"] == []
 
 
+def test_mid_dial_sizes_between_the_budget_and_the_whole_lot():
+    # The dial is CONTINUOUS, not a switch. At 0.5 the plan takes the
+    # $4,000 useful-loss budget plus half of the $36,000 excess = $22,000,
+    # i.e. 55 of 100 shares — not the whole lot (which is what any nonzero
+    # discount used to produce) and not merely the budget.
+    client.put("/tax-settings", json={
+        "expected_future_lt_rate": "0.15", "carryforward_discount": "0.5",
+    })
+    _one_thousand_st_gain()
+    add_security("LOTB", price=100)
+    buy("LOTB", 100, 500, "2026-01-05")            # -$40,000
+
+    plan = client.get("/harvest-plan?short_term_rate=0.37&long_term_rate=0.15").json()
+    step = plan["steps"][0]
+    assert step["partial"] is True
+    assert float(step["loss_harvested"]) == pytest.approx(-22000)
+    assert float(step["quantity_to_sell"]) == pytest.approx(55)
+    assert float(step["step_savings"]) == pytest.approx(1480)
+    assert float(step["step_carryforward"]) == pytest.approx(18000)
+
+
+def test_dial_sizing_is_monotone_across_the_range():
+    # Same lot, four dial settings: sell size must rise with the dial and
+    # land exactly on the documented endpoints (budget .. whole lot).
+    _one_thousand_st_gain()
+    add_security("LOTB", price=100)
+    buy("LOTB", 100, 500, "2026-01-05")            # -$40,000
+
+    sized = []
+    for dial in ["0", "0.25", "0.75", "1"]:
+        client.put("/tax-settings", json={
+            "expected_future_lt_rate": "0.15", "carryforward_discount": dial,
+        })
+        plan = client.get("/harvest-plan?short_term_rate=0.37&long_term_rate=0.15").json()
+        sized.append(float(plan["total_harvest_loss"]))
+
+    assert sized == sorted(sized)
+    assert sized[0] == pytest.approx(4000)              # dial 0 -> the budget
+    assert sized[-1] == pytest.approx(40000)            # dial 1 -> whole lot
+    assert sized[1] == pytest.approx(4000 + 36000 * 0.25)
+    assert sized[2] == pytest.approx(4000 + 36000 * 0.75)
+
+
 # ---------- spent replacement shares (review fix 4) ----------
 def test_spent_replacement_shares_dont_block_the_next_harvest():
     # Harvest one lot; its loss is fully absorbed by a recent 10-share buy.
