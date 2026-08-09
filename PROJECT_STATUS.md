@@ -1,4 +1,4 @@
-# HarvestIQ — System Status & Design (as of 2026-08-08)
+# HarvestIQ — System Status & Design (as of 2026-08-09)
 
 This document is a snapshot of where the project is, written so that "me in 5
 months" can rebuild the mental model without re-reading every file. It focuses on
@@ -58,10 +58,12 @@ and `price_stream.py → celery_app.py`.
   - *Netting engine:* `net_capital_position`, `tax_outcome`, `tax_owed`,
     `marginal_harvest_value` (→ savings, carryforward), `deferral_math`
     (→ future cost, net benefit), `holding_term` (calendar >1yr rule),
+    `holding_period_anniversary` (last short-term day),
     `effective_holding_date` (wash-tacked date).
-  - *Analysis:* `build_harvest_opportunities` (per-lot view, wash + DRIP
-    flags), `build_harvest_plan` (sequenced, sized, scored plan),
-    `build_portfolio_summary`.
+  - *Analysis:* `build_harvest_opportunities` (per-lot view, wash + DRIP +
+    seasoning flags), `build_harvest_plan` (sequenced, sized, scored plan;
+    `_size_harvest` for the sell size), `build_harvest_capacity` (the
+    remaining pool), `build_portfolio_summary`.
   - *Wash-sale enforcement:* `_transfer_disallowed_loss` (lot splitting),
     `apply_wash_sale_on_sell/on_buy`, `_disallow_against_external`,
     `apply_external_wash_on_sell/on_activity`.
@@ -91,12 +93,17 @@ and `price_stream.py → celery_app.py`.
 3. **The plan** (`GET /harvest-plan`) — greedy sequential: re-prices remaining
    candidates each round against the running position. Score =
    `savings + (future_rate × carryforward_discount) × carryforward`.
-   `carryforward_discount` (0..1, tax_settings) is the strategic dial:
-   0 = no gains coming → partial sells sized to land exactly on the remaining
-   useful-loss budget (`max(net + 3000, 0)`), never burns a big lot for
-   nothing; 1 = big gain coming → banks whole lots. Ties prefer less loss
-   spent, then whole-lot sells. Output: steps (quantity_to_sell/partial),
-   carryforward_only, excluded_wash_sale, three-number totals.
+   `carryforward_discount` (0..1, tax_settings) is the strategic dial, and it
+   moves the score AND the sell size **continuously** (`_size_harvest`):
+   `sized = budget + (full_loss − budget) × discount`, where budget is the
+   remaining useful loss (`max(net + 3000, 0)`). 0 = no gains coming → sized
+   to the budget, never burns a big lot for nothing; 1 = big gain coming →
+   banks whole lots; 0.3 → budget plus 30% of the excess. Sizing keys off the
+   *discount*, not `carryforward_price` (= `future_rate × discount`, a tax
+   rate) — using the latter would cap dial 1 at ~15% of the excess. Ties
+   prefer less loss spent, then whole-lot sells. Output: steps
+   (quantity_to_sell/partial), carryforward_only, excluded_wash_sale,
+   three-number totals.
 4. **Wash sales — detected AND enforced (IRC §1091)**
    - *Detection (before sale):* replacement shares = open window lots (≤30
      days) net of `wash_replacement_used`, excluding the candidate lot, PLUS
@@ -122,6 +129,28 @@ and `price_stream.py → celery_app.py`.
    `POST /transfers` moves lots between wallets carrying basis + dates
    (splitting on partial moves), realizing nothing. Per-wallet cost basis
    (Rev. Proc. 2024-28) enforced end-to-end.
+8. **Harvest capacity** (`GET /harvest-capacity`) — the remaining POOL of
+   unrealized loss, deliberately ignoring the useful-loss budget and the
+   dial. Harvesting spends the pool permanently (replacement basis resets
+   down); only new contributions refill it, and nothing else in the engine
+   tracked that. Reports total / available / wash-blocked (blocked loss is
+   unavailable today, **not** gone, so it counts in the total), capacity as
+   a % of market value, and per position `drawdown_to_harvest` — the
+   fraction price must FALL before that position's *highest-basis* lot goes
+   underwater. 0 = harvestable now; 0.30 = ossified, needs a 30% drop.
+   Headline scalars ride on `build_portfolio_summary` (lots/securities
+   passed through, so no extra queries on the websocket push).
+9. **Seasoning deadline** — a short-term loss crossing its anniversary
+   becomes long-term and is usually worth less. Priced, not just flagged:
+   the same loss is re-run as if already long-term and the difference is
+   `seasoning_savings_at_risk`; `seasoning_risk` only fires when that is
+   positive. Non-obvious: with only ST gains on the books a long-term loss
+   cross-nets into them at the short rate, so character is worth **zero**
+   and the flag correctly stays down — it needs LT gain competing for the
+   loss. Deadlines read `effective_holding_date`, so wash-tacked lots report
+   their real anniversary. Fields ride on opportunities, plan steps, and
+   `carryforward_only` (most important there — those are the lots being
+   deferred into next year). Window: `SEASONING_WARNING_DAYS = 30`.
 
 ---
 
@@ -144,7 +173,8 @@ the PLAN total (sequentially priced — per-lot figures don't sum), plus
 ## 6. Endpoint inventory (current)
 
 Tax analysis: `GET /harvest-opportunities` (per-lot, live), `GET /harvest-plan`
-(sequenced, live), `POST /tax-analysis/run` + `GET /tax-analysis` (cache),
+(sequenced, live), `GET /harvest-capacity` (remaining pool + per-position
+drawdown-to-harvest), `POST /tax-analysis/run` + `GET /tax-analysis` (cache),
 `GET/PUT /tax-settings` (carryforwards, expected_future_lt_rate,
 carryforward_discount), `GET /wash-sales` (enforced records),
 `GET /replacement-suggestions` (still a sector-based stub),
@@ -193,6 +223,66 @@ Alembic chain: `9142459bba1d` (initial) → `46e6748cbe94` (broker on lots) →
 - [x] Tests: 57 passing (`tests/test_engine.py` on in-memory SQLite +
       `tests/test_ws_prices.py`, which needs a live Redis).
 
+## 8b. STATUS — the "tax alpha decay" thread (2026-08-09 session)
+
+Prompted by a J.P. Morgan Private Bank piece arguing that harvesting decays
+as basis ratchets down ("tax alpha decay" / ossification) and that regular
+cash contributions of ~10–20% of account value per year are the fix.
+
+**What the article actually contains is one strategy** — add new cash to
+create fresh high-basis lots. Decay is the diagnosis, not the strategy;
+contribution frequency (they found monthly/quarterly/annual barely differ)
+and lump-sum-vs-gradual are parameters of it. Their headline figures (1–2%
+of tax savings a year, ~80% of it in the first five years) are model output
+under their own assumptions and are **deliberately not quoted anywhere in
+the product** — published lifetime estimates span ~15bp to ~110bp depending
+almost entirely on whether the study debits the future tax created. Given
+the SEC actions against Wealthfront and Betterment were both about
+overstating what harvesting did, borrowing a manager's point estimate would
+be exactly the wrong move.
+
+**Scope conclusion: mostly already handled.** The engine's real exposure to
+decay was that it treated unrealized loss as free — and migration 0010's
+partial sizing already fixed that. What was left was two small things and
+one bug, all now done:
+
+- [x] **Dial sizing was a switch, not a dial.** `build_harvest_plan` branched
+      on `carryforward_price > 0`, so any nonzero `carryforward_discount`
+      produced identical whole-lot sells; only the score varied continuously.
+      Replaced with `_size_harvest` (§4.3). Existing dial tests only covered
+      0 and 1, which is why it survived.
+- [x] **Harvest capacity metric** (§4.8) — the pool, the wash-blocked split,
+      `drawdown_to_harvest`, a fifth dashboard stat tile ("Harvest Capacity
+      Left" + `X% of portfolio · $Y wash-blocked`) and a line naming the most
+      ossified positions. Overview grid moved from `repeat(4, 1fr)` to
+      `repeat(auto-fit, minmax(180px, 1fr))` to take the fifth tile.
+- [x] **Seasoning deadline warning** (§4.9) — `Nd TO LONG-TERM` caution badge
+      on plan steps, opportunity rows and carryforward-only entries.
+- [x] Tests: 63 passing in `test_engine.py` (+6: 2 dial, 4 capacity, 4
+      seasoning, minus overlap in counting — see the file).
+
+**Audit item closed, not fixed:** the audit doc recommended ranking the plan
+by savings *per dollar of loss consumed* rather than absolute score. Checked
+against the code — the tie-break key `(score, -sized_loss, whole_lot)`
+already prefers spending less loss, and with partial sizing in place the
+plan never takes more than it needs anyway. No change made.
+
+**Deliberately NOT built: the contribution planner.** Sizing a recommended
+contribution (JPM's 10–20%) and routing it around open `safe_to_rebuy_after`
+windows is a real feature nobody ships, and HarvestIQ has the cross-account
+data to do it properly. It is parked because the advice half is where an
+asset manager's incentive and a user's diverge — contributions don't create
+value, they restore harvest *capacity*. The diagnostic half (§4.8) is the
+honest half and stands alone. If it is ever built, the framing must be "if
+you have the cash anyway, sequence it well", never "contribute in order to
+harvest".
+
+**Crypto caveat on all of the above:** the decay story assumes §1091 applies.
+It doesn't to crypto (property, per Notice 2014-21), so a harvested position
+can be rebought instantly — crypto ossifies through appreciation alone, with
+none of the wash-sale-driven drift, and arguably needs its own capacity math.
+Crypto ETPs are securities and behave like equities here.
+
 ## 9. TODO — what's left
 
 - Replacement suggestions are still same-sector-different-symbol; no tracking
@@ -205,6 +295,10 @@ Alembic chain: `9142459bba1d` (initial) → `46e6748cbe94` (broker on lots) →
 - Auth / multi-user — still the blocker to being genuinely "real".
 - Tests run on SQLite, not Postgres. Groq → Claude swap still pending.
 - Dark mode for the redesigned dashboard (palette has a validated dark set).
+- Capacity is a point-in-time number; no history, so the decay *curve*
+  (snapshot capacity over time and plot it) isn't there yet. Cheapest next
+  step on this thread if it's ever picked up again.
+- Contribution planner — see §8b for why it's parked rather than pending.
 
 ---
 
