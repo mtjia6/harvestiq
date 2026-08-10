@@ -11,7 +11,7 @@ httpx==0.28.1
 celery[redis]==5.6.3
 # Imported directly by app/celery_app.py and app/prices.py, so pin it
 # explicitly rather than relying on celery[redis] to pull it in.
-redis==6.4.0
+redis==8.1.0
 # Finnhub websocket client used by app/price_stream.py. Without this a clean
 # checkout ImportErrors on `import websocket`.
 websocket-client==1.9.0
