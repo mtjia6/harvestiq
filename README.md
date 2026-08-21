@@ -106,6 +106,21 @@ Enforcement runs at transaction time, in both directions. The disallowed loss do
 
 Crypto is exempt (property, not a security, per Notice 2014-21).
 
+### What you buy back
+
+Harvesting is supposed to be **exposure-neutral**: you sell the loser, put the same dollars into something that behaves like it, and end the day with the same market position and a tax deduction you didn't have this morning. That assumption is doing real work — it's what makes "your basis drops by exactly the loss you harvested" true, and it's why harvesting can be described as a deferral rather than a bet. Reinvest less than the proceeds and you haven't just harvested a loss, you've also reduced your market exposure, and any return those dollars would have earned is a cost that appears in none of the tax numbers.
+
+**What the replacement's basis is.** Whatever you pay for it — nothing carries over from the lot you sold. Sell 100 AAPL for $15,000 and put all $15,000 into the replacement and the new basis is $15,000 (fees included); put in $10,000 and it's $10,000. Proceeds and basis coincide only because you reinvested in full, not because of any rule connecting them. The one exception is the wash sale, where the replacement's basis is what you paid **plus** the disallowed loss — which is exactly the mechanism that hands the deduction back to you later.
+
+**How suggestions work today — honestly, this is a stub.** `GET /replacement-suggestions` takes each harvest opportunity, reads the sold security's `sector`, and returns every other security in the system sharing that sector. That's the entire algorithm. It is a starting point for a human, not an answer:
+
+- **No "substantially identical" screening.** The suggestions are same-sector-different-symbol. Whether a given pair is substantially identical is the actual legal question, and the IRS has never defined the term — two S&P 500 index funds from different issuers are the canonical unresolved case. Nobody has solved this; HarvestIQ does not pretend to.
+- **No correlation or tracking-error screen.** Same sector is a crude proxy for "behaves like the thing I sold." A replacement that diverges from the original is a tracking bet you didn't intend to make.
+- **No sizing.** The endpoint returns symbols, never a dollar amount or share count, and never references the proceeds of the sale it's replacing. The exposure-neutrality the tax math assumes is left entirely to you, and nothing in the system verifies you maintained it.
+- **No window check.** Suggestions are not cross-referenced against the ±30-day window — that enforcement happens at transaction time, when you actually record the buy.
+
+Only the universe of securities already known to HarvestIQ is searched, so the quality of the suggestions is bounded by what you've told it about.
+
 ### Warnings for the traps that actually bite people
 
 - **DRIP guard** — automatic dividend reinvestment is a purchase the wash-sale rule counts, and it's the single most common way people lose a harvested loss. If a distribution falls inside the ±30-day window, you get told to turn reinvestment off *before* selling.
@@ -258,7 +273,7 @@ This creates a diversified sample portfolio (equities + crypto across several se
 | `GET /harvest-capacity` | Harvestable loss remaining + per-position drawdown-to-harvest |
 | `GET /wash-sales` | Enforced wash-sale records with disallowed amounts |
 | `GET` / `PUT /tax-settings` | Carryforwards, expected future rate, carryforward dial |
-| `GET /replacement-suggestions` | Wash-sale-safe alternatives (still a sector-based stub) |
+| `GET /replacement-suggestions` | Same-sector alternatives per opportunity — a [stub](#what-you-buy-back): symbols only, no sizing, no identicality screen |
 | `POST /harvest-explanations` | Enqueue an AI-written harvest summary (202 + job id) |
 | `POST /tax-analysis/run` · `GET /tax-analysis` | Recompute / serve the cached analysis |
 
