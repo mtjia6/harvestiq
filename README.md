@@ -12,7 +12,7 @@ It applies the real IRS netting waterfall, **enforces** the wash-sale rule rathe
 
 When you sell an investment for less than you paid, that **capital loss** can offset your **capital gains** (and up to $3,000 of ordinary income per year), lowering your tax bill. Harvesting is the deliberate practice of selling losing positions to capture those losses while staying invested.
 
-The catch is the details: your exact cost basis per lot, your holding period, how much tax a sale actually saves *given everything else you've already realized this year*, and whether the **wash-sale rule** (rebuying a substantially identical security within ±30 days) would nullify the benefit.
+The catch is the details: your exact cost basis per lot, your holding period, how much tax a sale actually saves *given everything else you've already realized this year*, and whether the [**wash-sale rule**](#wash-sales-are-enforced-not-flagged) — which disallows your loss if you rebuy a substantially identical security within 30 days either side of the sale — would nullify the benefit.
 
 **The part most tools skip:** harvesting is mostly a *deferral*, not a saving. Selling at a loss and rebuying resets your cost basis **downward** by exactly the loss you harvested, so the eventual sale owes more. If your future tax rate matches today's, the lifetime benefit is close to zero — you've taken an interest-free loan, not free money. And if the gain you're offsetting would have been taxed at 0% anyway, harvesting actively *costs* you.
 
@@ -52,7 +52,13 @@ At **0** ("no gains coming") sells are sized to land exactly on the remaining us
 
 ### Wash sales are enforced, not flagged
 
-Detection runs *before* the sale — replacement shares are computed from open lots inside the ±30-day window, net of shares that already absorbed a previous disallowed loss (a share can only block one harvest, never two). Fully liquidating a fresh buy is correctly **not** flagged.
+**The rule, plainly.** If you sell a security at a loss and buy the same — or a "substantially identical" — security within **30 days before or 30 days after** that sale, the IRS disallows the loss (IRC §1091). It is a 61-day window centered on the sale day, and buying *first* and selling *second* triggers it just as buying after does. The loss is not deducted this year, so the harvest you were counting on produces nothing.
+
+The loss is usually deferred rather than destroyed. The disallowed amount is added to the **cost basis of the replacement shares**, and the holding period of the shares you sold is **tacked onto** them — so you recover the deduction when you eventually sell the replacement, and you keep credit for the time already served toward long-term treatment. The exceptions are the ones that hurt: if the replacement is bought in an IRA or 401k there is no taxable basis to adjust and the loss is **gone for good** (Rev. Rul. 2008-5).
+
+Three details that catch people. The rule follows the **taxpayer**, not the account — your spouse's account and your IRA count, and no broker can see them, so no broker's 1099-B is complete. **Any** purchase counts, including ones you did not consciously make: a dividend reinvestment, an automated recurring buy, an option exercise. And it applies **only to losses** — selling at a gain and rebuying immediately is fine.
+
+**How HarvestIQ handles it.** Detection runs *before* the sale — replacement shares are computed from open lots inside the ±30-day window, net of shares that already absorbed a previous disallowed loss (a share can only block one harvest, never two). Fully liquidating a fresh buy is correctly **not** flagged.
 
 Enforcement runs at transaction time, in both directions. The disallowed loss doesn't vanish: it attaches to the replacement **shares** — basis up, holding period tacked back. Partial washes **split the replacement lot**, because Treas. Reg. §1.1091-1 matches share-by-share: sell 40 and rebuy 100 and the loss attaches to 40 of those shares, not pro-rata across all 100.
 
