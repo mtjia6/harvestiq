@@ -50,6 +50,22 @@ sized = useful_loss_budget + (full_lot_loss − useful_loss_budget) × discount
 
 At **0** ("no gains coming") sells are sized to land exactly on the remaining useful-loss budget. At **1** ("big gain next year") it banks whole lots. At **0.3** it takes the budget plus 30% of the excess.
 
+### Which lot you sell is the whole trade
+
+**What a lot is.** Every purchase of a security is its own **tax lot**, with its own cost basis and its own purchase date. If you bought AAPL three times, you don't own "100 AAPL at an average price" for tax purposes — you own three separate lots, and a sale of 40 shares has to be attributed to specific ones. Which ones you pick determines the gain or loss you realize and whether it's short- or long-term. Same trade, same proceeds, different tax bill.
+
+**Why the default is the wrong one.** Absent an instruction, the IRS treats a sale as **first-in, first-out** — the oldest shares go first. In a position you've been adding to over time, the oldest shares are usually the cheapest, which means FIFO systematically sells your largest gain and your smallest loss. That is precisely backwards for harvesting: the default method is the one most hostile to the thing you're trying to do. Choosing a lot is not a micro-optimization on top of harvesting; **it is** harvesting.
+
+**Three methods**, on any sell via `lot_selection`:
+
+- `fifo` — oldest lot first. The IRS default, and what you get if you say nothing.
+- `hifo` — highest cost basis first, ties broken by age. Realizes the largest loss (or the smallest gain) per share sold; the sane default when you aren't targeting a particular lot.
+- `specific` — consume exactly the lots you name in `lot_ids`, in the order you give them. This is **specific identification**, the method the regulations actually contemplate, and the only one that lets a plan be executed as designed.
+
+That last one is why the plan is executable rather than advisory. Each step of `GET /harvest-plan` names a lot id and a quantity, and the dashboard's execute button fires that lot id straight back into `POST /transactions`. Reproducing a recommendation by hand in a broker interface usually falls back to FIFO — so you'd realize a different taxable result from the one that was valued. The advice would be correct and the outcome still wrong.
+
+**What the engine enforces.** Candidate lots are always filtered to *open* lots of that symbol **in that wallet** — sells are broker-scoped, so a lot at Fidelity can't satisfy a sale at Schwab. Specific ids are validated on all four counts (exists, right symbol, right wallet, still open) and rejected with a 400 rather than silently falling back. An oversell is refused before anything is written. And ordering always reads the real `opened_date`, never the wash-tacked holding-period date — tacking changes how a loss is *classified*, not which shares are physically oldest.
+
 ### Wash sales are enforced, not flagged
 
 **The rule, plainly.** If you sell a security at a loss and buy the same — or a "substantially identical" — security within **30 days before or 30 days after** that sale, the IRS disallows the loss (IRC §1091). It is a 61-day window centered on the sale day, and buying *first* and selling *second* triggers it just as buying after does. The loss is not deducted this year, so the harvest you were counting on produces nothing.
@@ -86,7 +102,7 @@ Universal pooled basis for crypto is dead. Rev. Proc. 2024-28 and Treas. Reg. §
 - **Harvest capacity** — the remaining pool of unrealized loss, plus per-position drawdown-to-harvest.
 - **Seasoning + DRIP warnings** — priced, not generic.
 - **Multi-wallet** — accounts registry, basis-preserving transfers, per-wallet basis (Rev. Proc. 2024-28).
-- **Lot selection** — FIFO, HIFO, or explicit lot ids on any sell.
+- **[Lot selection](#which-lot-you-sell-is-the-whole-trade)** — FIFO, HIFO, or specific identification by lot id on any sell, wallet-scoped and validated.
 - **Tax-lot tracking** — every purchase is its own lot with fee-inclusive cost basis and an oversell guard.
 - **Live market data** — prices stream over a Finnhub websocket; the dashboard updates itself over its own websocket.
 - **Price history** — 90-day daily bars from Yahoo Finance, Redis-cached.
