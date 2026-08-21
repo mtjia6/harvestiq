@@ -38,6 +38,20 @@ This matters most in a year you're already at a net loss: an extra harvest saves
 
 `GET /harvest-plan` simulates actually doing it: price every remaining candidate against the *current* net position, take the best, apply it, repeat. Once short-term gains are exhausted, a short-term loss that ranked first can legitimately fall behind a long-term one, and the plan sees that.
 
+**What "best" means.** Each candidate is scored on one number:
+
+```
+score = current_year_savings + (expected_future_rate × carryforward_discount) × carryforward_generated
+```
+
+Current-year savings are cash. Carryforward is a claim on a future year, so it is worth the rate you expect to pay then, marked down by how much you trust that expectation — which is the same `carryforward_discount` dial described below. Set it to 0 and the plan optimizes purely for cash this year; set it to 1 and a dollar banked counts as much as a dollar saved. The dial therefore does two jobs: it sizes each sell, and it sets the exchange rate the ranking uses.
+
+**Ties break toward thrift.** Equal scores prefer the lot that spends **less** unrealized loss, then a whole-lot sell over a partial one. This is the scarce-resource principle applied to ordering: when two harvests buy the same benefit, take the one that burns less of a resource you can never get back — and, all else equal, the one that's simpler to execute.
+
+**Where it stops.** The loop halts as soon as the best remaining score falls to `min_step_savings` (0 by default). Everything past that line still holds losses, but harvesting them buys nothing this year — so they're returned separately as `carryforward_only`, priced against the *post-plan* position, rather than padded into the plan as savings. Deferring those is a real choice, and lots with a seasoning deadline are flagged there specifically, because those are exactly the ones being left for next year.
+
+Note the two endpoints rank by different rules on purpose: `/harvest-opportunities` sorts by current-year savings then carryforward against a **static** position, while `/harvest-plan` re-scores every survivor against the position as it moves.
+
 ### Sells are sized, not all-or-nothing
 
 Unrealized loss is a scarce, non-renewable resource — harvesting spends it permanently. Selling a $40,000 lot to capture $4,000 of benefit burns ten times what the job needed.
