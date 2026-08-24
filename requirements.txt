@@ -1,11 +1,11 @@
 fastapi==0.141.1
 groq==1.6.0
 pydantic==2.13.4
-uvicorn==0.52.1
-alembic==1.18.5
-SQLAlchemy==2.0.51
+uvicorn==0.52.4
+alembic==1.19.1
+SQLAlchemy==2.0.52
 psycopg2-binary==2.9.12
-python-dotenv==1.2.2
+python-dotenv==1.2.3
 pytest==9.1.1
 httpx==0.28.1
 celery[redis]==5.6.3
@@ -19,4 +19,4 @@ websocket-client==1.9.0
 requests==2.34.2
 # Historical daily bars ONLY -- Finnhub's candle endpoints are premium.
 # Not reachable from any request handler; see app/prices.py.
-yfinance==1.5.2
+yfinance==1.6.0
