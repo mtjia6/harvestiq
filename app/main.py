@@ -11,9 +11,8 @@ from fastapi import (
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer
 from typing import Annotated, List, Literal, Optional
-from datetime import date, timedelta, datetime, timezone
+from datetime import date
 from decimal import Decimal
-from groq import Groq
 import asyncio
 import contextlib
 import json
@@ -40,7 +39,6 @@ from app.harvest import (
     build_harvest_opportunities,
     build_harvest_capacity,
     build_harvest_plan,
-    get_ytd_realized_totals,
     build_portfolio_summary,
     holding_term,
     effective_holding_date,

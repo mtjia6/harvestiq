@@ -2,7 +2,6 @@ from datetime import date, timedelta
 from app.model import (
     SecurityDB,
     TaxLotDB,
-    TransactionDB,
     RealizedGainDB,
     TaxSettingsDB,
     ExternalAccountDB,

@@ -7,30 +7,30 @@
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root {
     color-scheme: light;
-    /* warm paper system */
-    --paper:      #f6f4ee;   /* page plane */
-    --surface:    #fdfcf9;   /* cards */
-    --surface-2:  #f3f0e7;   /* insets, table header wash */
-    --ink:        #16130f;   /* primary */
-    --ink-2:      #57534b;   /* secondary */
-    --muted:      #8b867c;   /* labels, axes */
-    --hairline:   #e7e3d8;
-    --border:     rgba(22, 19, 15, .10);
-    /* brand */
-    --green:      #1d6b3f;   /* accent / series-1, validated on --surface */
+    /* paper */
+    --paper:      #f4f2ec;
+    --surface:    #fbfaf6;
+    --surface-2:  #edeae1;
+    --ink:        #191712;
+    --ink-2:      #4e4a42;
+    --muted:      #8a857a;
+    --rule:       #e2ded2;   /* hairlines inside a block */
+    --rule-2:     #cbc6b7;   /* block edges, section heads */
+    /* accent: used for actions and one series, nothing else */
+    --green:      #1d6b3f;
     --green-deep: #14512f;
-    --green-wash: rgba(29, 107, 63, .08);
-    /* money & status ink (dark enough for text on paper) */
-    --pos:        #006300;
-    --neg:        #c1362f;
-    --warn-ink:   #8a5b00;
-    --pos-wash:   rgba(0, 99, 0, .09);
-    --neg-wash:   rgba(193, 54, 47, .10);
-    --warn-wash:  rgba(176, 121, 8, .12);
+    --green-wash: rgba(29, 107, 63, .09);
+    /* money & status */
+    --pos:        #136113;
+    --neg:        #b3352e;
+    --warn-ink:   #84590a;
+    --pos-wash:   rgba(19, 97, 19, .10);
+    --neg-wash:   rgba(179, 53, 46, .10);
+    --warn-wash:  rgba(132, 89, 10, .13);
     --serif: "Fraunces", Georgia, serif;
     --sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
   }
@@ -38,125 +38,196 @@
   html { background: var(--paper); }
   body {
     margin: 0; background: var(--paper); color: var(--ink);
-    font-family: var(--sans); font-size: 14px; line-height: 1.5;
+    font-family: var(--sans); font-size: 13px; line-height: 1.45;
     -webkit-font-smoothing: antialiased;
   }
 
+  /* ---------- frame ---------- */
   header {
-    max-width: 1140px; margin: 0 auto; padding: 28px 32px 20px;
-    display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 12px;
+    max-width: 1180px; margin: 0 auto; padding: 20px 28px 14px;
+    display: flex; justify-content: space-between; align-items: baseline;
+    flex-wrap: wrap; gap: 12px;
   }
-  .wordmark { font-family: var(--serif); font-weight: 600; font-size: 30px; letter-spacing: -.01em; }
-  .wordmark .iq { color: var(--green); }
-  .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .wordmark {
+    font-family: var(--serif); font-weight: 600; font-size: 21px;
+    letter-spacing: -.015em; line-height: 1;
+  }
+  .sub { color: var(--muted); font-size: 12px; }
+  header .actions { display: flex; align-items: baseline; gap: 16px; }
 
-  main { padding: 0 32px 56px; max-width: 1140px; margin: 0 auto; }
+  main { padding: 0 28px 40px; max-width: 1180px; margin: 0 auto; }
 
+  /* Sections are rules, not boxes. Exactly one thing on this page floats
+     (.panel, the harvest plan) and that is what makes it read as the hero. */
   .card {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 14px; padding: 22px 24px; margin-bottom: 20px;
-    box-shadow: 0 1px 2px rgba(22,19,15,.04);
+    background: none; border: 0; border-top: 1px solid var(--rule-2);
+    border-radius: 0; box-shadow: none;
+    padding: 18px 0 6px; margin: 0 0 14px;
   }
-  h2 { margin: 0 0 14px; font-family: var(--serif); font-weight: 600; font-size: 19px; letter-spacing: -.01em; }
+  .card.panel {
+    background: var(--surface); border: 1px solid var(--rule-2);
+    border-radius: 6px; padding: 16px 18px 14px; margin: 18px 0;
+  }
+  h2 {
+    margin: 0 0 12px; font-family: var(--sans); font-weight: 600;
+    font-size: 14px; letter-spacing: -.005em;
+  }
+  .panel h2 { font-size: 16px; }
   h3 {
-    margin: 0 0 10px; font-family: var(--sans); font-weight: 600; font-size: 11px;
-    color: var(--muted); text-transform: uppercase; letter-spacing: .08em;
+    margin: 0 0 8px; font-weight: 600; font-size: 10.5px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .07em;
+  }
+  .section-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    flex-wrap: wrap; gap: 10px;
   }
 
-  /* stat tiles */
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
-  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px; box-shadow: 0 1px 2px rgba(22,19,15,.04); }
-  .stat .label { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
-  .stat .value { font-family: var(--serif); font-weight: 600; font-size: 30px; letter-spacing: -.01em; margin-top: 6px; }
-  .stat .subvalue { font-size: 12px; color: var(--ink-2); margin-top: 4px; }
+  /* ---------- readout strip ---------- */
+  .grid {
+    display: grid; grid-template-columns: repeat(5, 1fr);
+    border: 1px solid var(--rule-2); border-radius: 6px;
+    background: var(--surface); overflow: hidden;
+  }
+  .stat {
+    padding: 11px 15px 12px; border-left: 1px solid var(--rule);
+    background: none; border-radius: 0; box-shadow: none;
+  }
+  .stat:first-child { border-left: 0; }
+  .stat.key { background: var(--green-wash); }
+  .stat .label { font-size: 11px; font-weight: 500; color: var(--muted); }
+  .stat .value {
+    font-weight: 600; font-size: 20px; letter-spacing: -.02em; margin-top: 2px;
+    font-variant-numeric: tabular-nums;
+  }
+  .stat .subvalue { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
 
-  .controls { display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap; }
-  label { display: block; font-size: 12px; color: var(--ink-2); margin-bottom: 5px; font-weight: 500; }
+  /* ---------- inputs ---------- */
+  .controls { display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap; }
+  .toolbar {
+    display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap;
+    padding: 12px 0 2px;
+  }
+  label { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 4px; }
   input, select {
-    background: var(--surface); border: 1px solid var(--hairline); color: var(--ink);
-    border-radius: 9px; padding: 8px 11px; font: inherit; font-size: 14px;
+    background: #fff; border: 1px solid var(--rule-2); color: var(--ink);
+    border-radius: 4px; padding: 6px 8px; font: inherit; font-size: 13px;
   }
-  input { width: 130px; }
-  input:focus, select:focus { outline: 2px solid var(--green-wash); border-color: var(--green); }
+  input { width: 112px; font-variant-numeric: tabular-nums; }
+  input:focus, select:focus { outline: none; border-color: var(--green); box-shadow: 0 0 0 2px var(--green-wash); }
 
+  /* Quiet by default. Green is reserved for the one button that moves money. */
   button {
-    background: var(--green); color: #fff; border: none; border-radius: 9px;
-    padding: 9px 18px; font: inherit; font-weight: 600; font-size: 14px; cursor: pointer;
+    background: var(--surface); color: var(--ink);
+    border: 1px solid var(--rule-2); border-radius: 4px;
+    padding: 6px 12px; font: inherit; font-size: 13px; font-weight: 500; cursor: pointer;
   }
-  button:hover { background: var(--green-deep); }
-  button.secondary { background: transparent; color: var(--green); border: 1px solid var(--green); }
-  button.secondary:hover { background: var(--green-wash); }
-  button.small { padding: 6px 12px; font-size: 12.5px; }
-  button.danger-armed { background: var(--neg); color: #fff; }
+  button:hover { background: var(--surface-2); }
+  button.go { background: var(--green); border-color: var(--green); color: #fff; font-weight: 600; }
+  button.go:hover { background: var(--green-deep); border-color: var(--green-deep); }
+  button.secondary {
+    background: none; border: 0; color: var(--green); padding: 6px 0;
+    font-weight: 500; text-decoration: underline; text-underline-offset: 3px;
+    text-decoration-color: var(--green-wash);
+  }
+  button.secondary:hover { background: none; text-decoration-color: currentColor; }
+  button.small { padding: 4px 9px; font-size: 12px; }
+  button.danger-armed { background: var(--neg); border-color: var(--neg); color: #fff; }
   button:disabled { opacity: .45; cursor: not-allowed; }
 
-  table { width: 100%; border-collapse: collapse; margin-top: 6px; }
-  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--hairline); font-size: 13.5px; }
-  td { font-variant-numeric: tabular-nums; }
+  /* ---------- tables ---------- */
+  table { width: 100%; border-collapse: collapse; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 6px 10px 6px 0; border-bottom: 1px solid var(--rule); font-size: 12.5px; }
   th {
-    color: var(--muted); font-weight: 600; font-size: 10.5px;
-    text-transform: uppercase; letter-spacing: .07em; border-bottom-color: var(--hairline);
+    color: var(--muted); font-weight: 600; font-size: 10px;
+    text-transform: uppercase; letter-spacing: .06em;
+    border-bottom: 1px solid var(--rule-2); padding-bottom: 5px;
   }
   tbody tr:last-child td { border-bottom: none; }
   tbody tr:hover td { background: var(--surface-2); }
+  td:first-child, th:first-child { padding-left: 2px; }
 
   .pos { color: var(--pos); } .neg { color: var(--neg); }
   .badge {
-    font-size: 11px; font-weight: 600; padding: 2.5px 9px; border-radius: 99px; white-space: nowrap;
-    border: 1px solid transparent;
+    display: inline-block; font-size: 9.5px; font-weight: 600; letter-spacing: .05em;
+    text-transform: uppercase; padding: 1.5px 5px; border-radius: 3px; white-space: nowrap;
+    vertical-align: 1px;
   }
   .badge.ok      { background: var(--pos-wash);  color: var(--pos); }
   .badge.warn    { background: var(--neg-wash);  color: var(--neg); }
   .badge.caution { background: var(--warn-wash); color: var(--warn-ink); }
 
-  .plan-totals { display: flex; gap: 28px; flex-wrap: wrap; margin: 2px 0 10px; font-size: 14px; color: var(--ink-2); }
-  .plan-totals strong { font-family: var(--serif); font-size: 19px; font-weight: 600; letter-spacing: -.01em; }
-  .tally { margin-top: 12px; font-size: 13px; color: var(--muted); }
-  .tally strong { color: var(--ink); }
-  .explanation { white-space: pre-wrap; line-height: 1.6; font-size: 14px; margin-top: 12px; color: var(--ink-2); }
+  /* ---------- plan ---------- */
+  .plan-totals {
+    display: flex; gap: 26px; flex-wrap: wrap; align-items: baseline;
+    margin: 0 0 12px; padding-bottom: 12px; border-bottom: 1px solid var(--rule);
+    font-size: 11.5px; color: var(--muted);
+  }
+  .plan-totals:empty { display: none; }
+  .plan-totals span { display: flex; flex-direction: column; gap: 1px; }
+  .plan-totals strong {
+    font-size: 17px; font-weight: 600; letter-spacing: -.02em;
+    font-variant-numeric: tabular-nums; color: var(--ink);
+  }
+  .tally { margin-top: 10px; font-size: 12px; color: var(--muted); }
+  .tally strong { color: var(--ink); font-variant-numeric: tabular-nums; }
+  .explanation { white-space: pre-wrap; line-height: 1.6; font-size: 13px; margin-top: 10px; color: var(--ink-2); max-width: 68ch; }
   .muted { color: var(--muted); }
-  .disclaimer { font-size: 12.5px; color: var(--muted); margin-top: 8px; line-height: 1.55; }
+  .note, .disclaimer { font-size: 12px; color: var(--muted); line-height: 1.5; max-width: 78ch; }
+  .disclaimer { margin-top: 6px; }
 
-  .settings-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; }
-  .settings-grid input, .settings-grid select { width: 100%; margin-bottom: 10px; }
-  .settings-grid .row { display: flex; gap: 8px; }
+  /* ---------- configuration (deliberately recessive) ---------- */
+  .config { margin-top: 34px; padding-top: 4px; border-top: 2px solid var(--rule-2); }
+  .config > h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .09em; color: var(--muted); margin: 12px 0 2px; }
+  .config .card { border-top-color: var(--rule); }
+  .config input, .config select, .config button { font-size: 12.5px; }
+
+  .settings-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 26px; }
+  .settings-grid input, .settings-grid select { width: 100%; margin-bottom: 8px; }
+  .settings-grid .row { display: flex; gap: 6px; }
   .settings-grid .row > * { flex: 1; }
-  .extra-list { font-size: 13px; color: var(--ink-2); margin-top: 10px; line-height: 1.7; }
+  .extra-list { font-size: 12.5px; color: var(--ink-2); margin-top: 8px; line-height: 1.65; }
   .extra-list strong { color: var(--ink); }
-  .saved-note { font-size: 12.5px; color: var(--pos); margin-top: 4px; min-height: 17px; }
+  .saved-note { font-size: 12px; color: var(--pos); margin-top: 4px; min-height: 16px; }
 
-  @media (max-width: 800px) {
-    .settings-grid { grid-template-columns: 1fr; }
+  footer {
+    max-width: 1180px; margin: 0 auto; padding: 0 28px 36px;
+    font-size: 11.5px; color: var(--muted); line-height: 1.5; max-width: 78ch;
+  }
+
+  @media (max-width: 900px) {
     .grid { grid-template-columns: repeat(2, 1fr); }
-    header, main { padding-left: 18px; padding-right: 18px; }
+    .stat:nth-child(odd) { border-left: 0; }
+    .stat { border-top: 1px solid var(--rule); }
+    .stat:nth-child(-n+2) { border-top: 0; }
+  }
+  @media (max-width: 760px) {
+    .settings-grid { grid-template-columns: 1fr; }
+    header, main { padding-left: 16px; padding-right: 16px; }
   }
 </style>
 </head>
 <body>
 <header>
-  <div>
-    <div class="wordmark">Harvest<span class="iq">IQ</span></div>
-    <div class="sub">Tax-loss harvesting, priced honestly</div>
-  </div>
-  <div style="text-align:right;">
-    <button class="secondary" onclick="recomputeTax()">Recompute analysis</button>
-    <div id="asOf" class="sub" style="margin-top:8px;">Prices stream live</div>
+  <div class="wordmark">HarvestIQ</div>
+  <div class="actions">
+    <div id="asOf" class="sub">Prices stream live</div>
+    <button class="secondary" onclick="recomputeTax()">Recompute</button>
   </div>
 </header>
 
 <main>
   <!-- OVERVIEW -->
   <div class="grid" id="overview">
-    <div class="stat"><div class="label">Portfolio Value</div><div class="value" id="s_value">—</div></div>
+    <div class="stat"><div class="label">Portfolio value</div><div class="value" id="s_value">—</div></div>
     <div class="stat"><div class="label">Unrealized G/L</div><div class="value" id="s_unrealized">—</div></div>
-    <div class="stat"><div class="label">Realized G/L (YTD)</div><div class="value" id="s_realized">—</div></div>
-    <div class="stat">
-      <div class="label">Plan Savings (this year)</div>
+    <div class="stat"><div class="label">Realized G/L, YTD</div><div class="value" id="s_realized">—</div></div>
+    <div class="stat key">
+      <div class="label">Plan savings, this year</div>
       <div class="value pos" id="s_savings">—</div>
       <div class="subvalue" id="s_net"></div>
     </div>
     <div class="stat">
-      <div class="label">Harvest Capacity Left</div>
+      <div class="label">Capacity left</div>
       <div class="value" id="s_capacity">—</div>
       <div class="subvalue" id="s_capacitySub"></div>
     </div>
@@ -164,20 +235,18 @@
   <div class="disclaimer" id="budgetLine"></div>
   <div class="disclaimer" id="capacityLine"></div>
 
-  <!-- CONTROLS -->
-  <div class="card" style="margin-top:20px;">
-    <div class="controls">
-      <div><label>Short-term rate</label><input id="shortRate" type="number" step="0.01" value="0.15"></div>
-      <div><label>Long-term rate</label><input id="longRate" type="number" step="0.01" value="0.05"></div>
-      <div><label>Min. step savings ($)</label><input id="minSavings" type="number" step="1" value="0"></div>
-      <button onclick="reloadAll()">Update</button>
-    </div>
+  <!-- RATES -->
+  <div class="toolbar">
+    <div><label>Short-term rate</label><input id="shortRate" type="number" step="0.01" value="0.15"></div>
+    <div><label>Long-term rate</label><input id="longRate" type="number" step="0.01" value="0.05"></div>
+    <div><label>Min. step savings ($)</label><input id="minSavings" type="number" step="1" value="0"></div>
+    <button onclick="reloadAll()">Update</button>
   </div>
 
   <!-- HARVEST PLAN (the headline) -->
-  <div class="card">
-    <div style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:8px;">
-      <h2>Harvest plan — do these, in this order</h2>
+  <div class="card panel">
+    <div class="section-head">
+      <h2>Harvest plan <span class="sub" style="font-weight:400;">sell in this order</span></h2>
       <div class="sub" id="planStop"></div>
     </div>
     <div class="plan-totals" id="planTotals"></div>
@@ -193,15 +262,44 @@
 
   <!-- HARVEST TABLE (per-lot view) -->
   <div class="card">
-    <h2>Harvest opportunities, lot by lot</h2>
-    <div class="disclaimer" style="margin:0 0 8px;">Each row is priced independently against today's position — the numbers are comparable but don't sum. The plan above is what they add up to when executed in sequence.</div>
+    <h2>Lot detail</h2>
+    <div class="note" style="margin:0 0 8px;">Every row is priced independently against today's position, so the rows compare but do not sum. The plan above is what they come to in sequence.</div>
     <div id="oppArea"><p class="muted">Loading…</p></div>
     <div class="tally" id="tally"></div>
   </div>
 
+  <!-- PRICE CHART -->
+  <div class="card">
+    <div class="section-head">
+      <h2>Price history <span class="sub" style="font-weight:400;">90 days</span></h2>
+      <select id="chartSymbol" onchange="loadChart()"></select>
+    </div>
+    <canvas id="priceChart" height="90"></canvas>
+  </div>
+
+  <!-- AI -->
+  <div class="card">
+    <div class="section-head">
+      <h2>Explanation</h2>
+      <button class="secondary" onclick="loadExplanation()">Write one</button>
+    </div>
+    <div id="explanation" class="explanation muted">No explanation yet.</div>
+  </div>
+
+  <!-- REALIZED LOG -->
+  <div class="card">
+    <div class="section-head">
+      <h2>Realized gains</h2>
+      <button class="secondary" onclick="exportCSV()">Export CSV</button>
+    </div>
+    <div id="realizedArea"><p class="muted">Loading…</p></div>
+  </div>
+
+  <div class="config">
+  <h2>Configuration</h2>
   <!-- SETTINGS -->
   <div class="card">
-    <h2>Tax &amp; account settings</h2>
+    <h2>Tax &amp; accounts</h2>
     <div class="settings-grid">
       <div>
         <h3>Carryforward &amp; future rate</h3>
@@ -218,7 +316,7 @@
       </div>
       <div>
         <h3>Watch-only accounts</h3>
-        <div class="disclaimer" style="margin:0 0 8px;">Other brokers &amp; retirement accounts. We never sell from these — we only count their buys against the wash-sale window. An IRA buy destroys a harvested loss permanently.</div>
+        <div class="note" style="margin:0 0 8px;">Other brokers &amp; retirement accounts. We never sell from these — we only count their buys against the wash-sale window. An IRA buy destroys a harvested loss permanently.</div>
         <div class="row">
           <input id="extName" placeholder="Name (Fidelity Roth IRA)">
           <select id="extType">
@@ -249,7 +347,7 @@
       </div>
       <div>
         <h3>Dividend reinvestment (DRIP)</h3>
-        <div class="disclaimer" style="margin:0 0 8px;">An automatic reinvestment is a purchase the wash-sale rule counts. Declare it so we can warn you to turn it off before harvesting.</div>
+        <div class="note" style="margin:0 0 8px;">An automatic reinvestment is a purchase the wash-sale rule counts. Declare it so we can warn you to turn it off before harvesting.</div>
         <label>Security</label>
         <select id="dripSymbol" onchange="showDripFor()"></select>
         <label style="display:flex; align-items:center; gap:8px; margin:8px 0;">
@@ -265,8 +363,8 @@
 
   <!-- WALLETS & TRANSFERS -->
   <div class="card">
-    <h2>Wallets &amp; transfers</h2>
-    <div class="disclaimer" style="margin:0 0 8px;">A transfer moves lots between your wallets carrying cost basis and holding period with them — it is not a sale, nothing is realized. Sells always draw only from the wallet they happen in (per-wallet basis, Rev. Proc. 2024-28).</div>
+    <h2>Wallets</h2>
+    <div class="note" style="margin:0 0 8px;">A transfer moves lots between your wallets carrying cost basis and holding period with them — it is not a sale, nothing is realized. Sells always draw only from the wallet they happen in (per-wallet basis, Rev. Proc. 2024-28).</div>
     <div id="acctList" class="extra-list" style="margin-bottom:12px;">Loading…</div>
     <div class="controls">
       <div><label>Symbol</label><select id="xferSymbol"></select></div>
@@ -279,33 +377,14 @@
     <div class="saved-note" id="xferSaved"></div>
   </div>
 
-  <!-- PRICE CHART -->
-  <div class="card">
-    <div style="display:flex; justify-content:space-between; align-items:center;">
-      <h2>Price history, last 90 days</h2>
-      <select id="chartSymbol" onchange="loadChart()"></select>
-    </div>
-    <canvas id="priceChart" height="90"></canvas>
   </div>
 
-  <!-- AI -->
-  <div class="card">
-    <h2>Plain-English explanation</h2>
-    <button class="secondary" onclick="loadExplanation()">Explain my options</button>
-    <div id="explanation" class="explanation muted">No explanation yet.</div>
-  </div>
-
-  <!-- REALIZED LOG -->
-  <div class="card">
-    <div style="display:flex; justify-content:space-between; align-items:center;">
-      <h2>Realized gains log</h2>
-      <button class="secondary" onclick="exportCSV()">Export CSV</button>
-    </div>
-    <div id="realizedArea"><p class="muted">Loading…</p></div>
-  </div>
-
-  <div class="disclaimer">General information only — not personalized tax advice. Harvesting defers tax by lowering cost basis; benefit depends on your bracket.</div>
 </main>
+
+<footer>
+  General information only, not personalized tax advice. Harvesting defers tax by lowering cost
+  basis; what it is worth depends on your bracket.
+</footer>
 
 <script>
 let realizedCache = [];
@@ -450,7 +529,7 @@ async function loadPlan() {
         <td class="${cls(s.step_net_benefit)}">${money(s.step_net_benefit)}</td>
         <td class="pos">${money(s.cumulative_savings)}</td>
         <td>${s.lot_broker
-              ? `<button class="small" onclick="executeStep(this)" data-lot="${s.lot_id}" data-symbol="${esc(s.symbol)}" data-qty="${s.quantity_to_sell}" data-broker="${esc(s.lot_broker)}">Sell${s.partial ? ' part of' : ''} lot #${s.lot_id}</button>`
+              ? `<button class="small go" onclick="executeStep(this)" data-lot="${s.lot_id}" data-symbol="${esc(s.symbol)}" data-qty="${s.quantity_to_sell}" data-broker="${esc(s.lot_broker)}">Sell${s.partial ? ' part of' : ''} lot #${s.lot_id}</button>`
               : '<span class="muted" title="This lot has no broker recorded, so a specific-lot sell cannot be routed.">no broker</span>'}</td>
       </tr>`).join('');
     area.innerHTML = `
@@ -513,7 +592,7 @@ async function executeStep(btn) {
     }),
   });
   if (res.ok) {
-    btn.textContent = 'Sold ✓';
+    btn.textContent = 'Sold';
     recomputeTax();               // refresh the cache, then repaint everything
   } else {
     const err = await res.json().catch(() => ({}));
@@ -776,21 +855,21 @@ async function loadChart() {
     type: 'line',
     data: { labels, datasets: [{
       label: sym + ' close', data: prices,
-      borderColor: '#1d6b3f', backgroundColor: 'rgba(29,107,63,.07)',
-      borderWidth: 2, fill: true, tension: .2, pointRadius: 0, pointHitRadius: 12
+      borderColor: '#1d6b3f', backgroundColor: 'rgba(29,107,63,.06)',
+      borderWidth: 1.5, fill: true, tension: .15, pointRadius: 0, pointHitRadius: 12
     }]},
     options: {
       interaction: { mode: 'index', intersect: false },
       plugins: {
         legend: { display: false },   // one series: the title names it
         tooltip: {
-          backgroundColor: '#16130f', titleColor: '#fdfcf9', bodyColor: '#e7e3d8',
-          padding: 10, cornerRadius: 8, displayColors: false
+          backgroundColor: '#191712', titleColor: '#fbfaf6', bodyColor: '#cbc6b7',
+          padding: 8, cornerRadius: 4, displayColors: false
         }
       },
       scales: {
-        x: { ticks: { color: '#8b867c', maxTicksLimit: 6, font: { family: 'Inter' } }, grid: { display: false }, border: { color: '#c9c5b8' } },
-        y: { ticks: { color: '#8b867c', font: { family: 'Inter' } }, grid: { color: '#e7e3d8' }, border: { display: false } }
+        x: { ticks: { color: '#8a857a', maxTicksLimit: 6, font: { family: 'Inter', size: 10 } }, grid: { display: false }, border: { color: '#cbc6b7' } },
+        y: { ticks: { color: '#8a857a', font: { family: 'Inter', size: 10 } }, grid: { color: '#e2ded2' }, border: { display: false } }
       }
     }
   });

@@ -309,7 +309,7 @@ This creates a diversified sample portfolio (equities + crypto across several se
 python3 -m pytest -v
 ```
 
-63 tests. They cover the netting waterfall and its edge cases (the $3,000 cap, net-loss years where an extra harvest saves nothing, character preservation), wash-sale enforcement (basis adjustment, holding-period tacking, lot splitting on partial washes, spent replacement shares, cross-account and retirement-account cases), plan sequencing and sell sizing across the carryforward dial, harvest capacity, seasoning deadlines, per-wallet basis through transfers, and the crypto exemption.
+68 tests. They cover the netting waterfall and its edge cases (the $3,000 cap, net-loss years where an extra harvest saves nothing, character preservation), wash-sale enforcement (basis adjustment, holding-period tacking, lot splitting on partial washes, spent replacement shares, cross-account and retirement-account cases), plan sequencing and sell sizing across the carryforward dial, harvest capacity, seasoning deadlines, per-wallet basis through transfers, and the crypto exemption.
 
 `tests/test_ws_prices.py` needs a live Redis; `tests/test_engine.py` runs standalone on in-memory SQLite.
 
