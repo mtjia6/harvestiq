@@ -1,11 +1,11 @@
-fastapi==0.141.1
-groq==1.6.0
-pydantic==2.13.4
-uvicorn==0.52.1
-alembic==1.18.5
-SQLAlchemy==2.0.51
-psycopg2-binary==2.9.12
-python-dotenv==1.2.2
+fastapi==0.142.2
+groq==1.7.0
+pydantic==2.13.5
+uvicorn==0.54.0
+alembic==1.20.0
+SQLAlchemy==2.1.1
+psycopg2-binary==2.9.13
+python-dotenv==1.2.4
 pytest==9.1.1
 httpx==0.28.1
 celery[redis]==5.6.3
@@ -14,9 +14,9 @@ celery[redis]==5.6.3
 redis==6.4.0
 # Finnhub websocket client used by app/price_stream.py. Without this a clean
 # checkout ImportErrors on `import websocket`.
-websocket-client==1.9.0
+websocket-client==1.9.2
 # Finnhub REST calls in app/prices.py, and seed.py.
 requests==2.34.2
 # Historical daily bars ONLY -- Finnhub's candle endpoints are premium.
 # Not reachable from any request handler; see app/prices.py.
-yfinance==1.5.2
+yfinance==1.7.0
