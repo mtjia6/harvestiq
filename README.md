@@ -1,346 +1,315 @@
 # HarvestIQ
 
-An AI-assisted **tax-loss harvesting engine** for stock and crypto portfolios. HarvestIQ tracks your holdings at the tax-lot level across multiple wallets and accounts, values them against live market prices, and produces an ordered, executable **harvest plan**: which lots to sell, in what order, sized to what actually helps, with three honest numbers per step — what it saves now, what it costs later, and the net.
+HarvestIQ is a tax-loss harvesting engine for stock and crypto portfolios. It tracks holdings at the tax-lot level across multiple wallets, values them against live market prices, and generates an ordered plan of which lots to sell. A live dashboard shows the plan and updates it as prices move.
 
-It applies the real IRS netting waterfall, **enforces** the wash-sale rule rather than just flagging it, and tells you when harvesting is a bad idea.
+The backend runs as three processes: a FastAPI web server, a Celery worker, and a market-data streamer. They coordinate through Redis and PostgreSQL. This document describes how the backend works. The tax logic itself is documented in [docs/TAX_ENGINE.md](docs/TAX_ENGINE.md).
 
-> ⚠️ **Educational tool, not tax advice.** The harvesting *logic* is rigorous; the *tax rate model* is a stated simplification you supply. Read [Known limitations](#known-limitations) before trusting a dollar figure — that section is not boilerplate.
-
----
-
-## What is tax-loss harvesting?
-
-When you sell an investment for less than you paid, that **capital loss** can offset your **capital gains** (and up to $3,000 of ordinary income per year), lowering your tax bill. Harvesting is the deliberate practice of selling losing positions to capture those losses while staying invested.
-
-The catch is the details: your exact cost basis per lot, your holding period, how much tax a sale actually saves *given everything else you've already realized this year*, and whether the [**wash-sale rule**](#wash-sales-are-enforced-not-flagged) — which disallows your loss if you rebuy a substantially identical security within 30 days either side of the sale — would nullify the benefit.
-
-**The part most tools skip:** harvesting is mostly a *deferral*, not a saving. Selling at a loss and rebuying resets your cost basis **downward** by exactly the loss you harvested, so the eventual sale owes more. If your future tax rate matches today's, the lifetime benefit is close to zero — you've taken an interest-free loan, not free money. And if the gain you're offsetting would have been taxed at 0% anyway, harvesting actively *costs* you.
-
-HarvestIQ shows you both sides of that trade on every recommendation.
-
-**Worked example.** You own 100 AAPL bought at $200 ($20,000 basis); it's now $150 ($15,000). You also have an $8,000 realized short-term gain this year. Sell the AAPL → realize a $5,000 loss → it cancels $5,000 of that gain → at a 37% rate you save $1,850 now. But your replacement position carries a $15,000 basis instead of $20,000, so you'll owe roughly $750 more when you eventually sell (at a 15% long-term rate). Net lifetime benefit ≈ $1,100, not $1,850. HarvestIQ reports all three numbers.
+**Stack:** Python, FastAPI, PostgreSQL, SQLAlchemy, Alembic, Redis, Celery, WebSockets, Finnhub, yfinance, Groq, vanilla JS + Chart.js, pytest
 
 ---
 
-## The tax engine
-
-This is the part worth reading. Most consumer tools stop at "this position is down, sell it."
-
-### Real netting, not a flat multiply
-
-Losses don't just get multiplied by a rate. They cancel gains of their **own character first** (short-term against short-term, long-term against long-term), then cross-net, then hit the **$3,000 ordinary-income cap**, then roll forward as carryforwards that keep their character. `marginal_harvest_value` prices every loss against your *effective* position — realized year-to-date, minus prior-year carryforwards — and returns current-year savings and carryforward generated as **two separate numbers**, never conflated.
-
-This matters most in a year you're already at a net loss: an extra harvest saves you **$0**, and a flat-rate engine will happily report thousands in phantom savings.
-
-### The plan is sequenced, not a ranked list
-
-`GET /harvest-opportunities` prices each lot against the same starting position, so the figures are comparable but **do not sum** — harvest the first one and every other number is stale.
-
-`GET /harvest-plan` simulates actually doing it: price every remaining candidate against the *current* net position, take the best, apply it, repeat. Once short-term gains are exhausted, a short-term loss that ranked first can legitimately fall behind a long-term one, and the plan sees that.
-
-**What "best" means.** Each candidate is scored on one number:
+## Architecture
 
 ```
-score = current_year_savings + (expected_future_rate × carryforward_discount) × carryforward_generated
+   Finnhub (wss)                                           Browser dashboard
+        │ trade frames                                    ▲  HTTP + WS /ws/prices
+        ▼                                                 │
+ ┌─────────────┐   PUBLISH "prices"    ┌─────────────┐  SUBSCRIBE  ┌─────────────┐
+ │  streamer   │ ────────────────────▶ │             │ ──────────▶ │   FastAPI   │
+ │  process    │                       │    Redis    │             │    (web)    │
+ │             │   enqueue task (30s)  │             │  GET cache  │             │
+ │             │ ────────────────────▶ │  broker     │ ◀────────── │             │
+ └──────┬──────┘                       │  results    │  enqueue    └──────┬──────┘
+        │                              │  cache      │                    │
+        │                              │  pub/sub    │                    │
+        │                              └──┬───────▲──┘                    │
+        │                         consume │       │ SET tax_analysis      │
+        │                                 ▼       │                       │
+        │                              ┌──────────┴──┐                    │
+        │                              │   Celery    │ ───▶ Groq (LLM)    │
+        │                              │   worker    │                    │
+        │                              └──────┬──────┘                    │
+        │ UPDATE changed prices               │ read lots                 │ read/write
+        ▼                                     ▼                           ▼
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │                PostgreSQL: transactions · tax lots · realized gains          │
+ └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Current-year savings are cash. Carryforward is a claim on a future year, so it is worth the rate you expect to pay then, marked down by how much you trust that expectation — which is the same `carryforward_discount` dial described below. Set it to 0 and the plan optimizes purely for cash this year; set it to 1 and a dollar banked counts as much as a dollar saved. The dial therefore does two jobs: it sizes each sell, and it sets the exchange rate the ranking uses.
+| Component | Entry point | Role |
+| --- | --- | --- |
+| Web server | `app/main.py` | REST API, dashboard, `/ws/prices` broadcaster, transaction processing |
+| Worker | `app/celery_app.py` | Harvest analysis and LLM explanations |
+| Streamer | `app/price_stream.py` | Finnhub websocket client, price persistence, change notifications |
+| Domain logic | `app/harvest.py` | Netting, plan generation, wash-sale rules (pure Python, no I/O framework imports) |
+| Market data | `app/prices.py` | All outbound vendor calls |
+| Models | `app/model.py` | SQLAlchemy models |
 
-**Why this formula and not a simpler one.** Ranking by *size of loss* is the obvious choice and the wrong one — the biggest loss is not the biggest benefit, and in a year where your gains are already used up it buys nothing at all. Ranking by *current-year savings alone* is right until it isn't: once the useful-loss budget is spent, every remaining lot scores exactly zero and the order goes arbitrary — precisely when the user still has real choices to make between lots. The second term exists to keep the ranking meaningful past that point.
-
-Adding the two terms requires a price, because they aren't the same thing: one is cash this April, the other is a claim on a future return. The only defensible conversion is the tax rate you expect to pay when you actually use the carryforward, marked down by how much you believe your own forecast — which is exactly `expected_future_rate × carryforward_discount`. HarvestIQ makes you supply both rather than inferring a discount from an assumed horizon and rate path: fewer hidden assumptions, and every number in the plan can be traced back to a dial you set.
-
-The sum is linear because both terms are already denominated in dollars of tax. That's a real modeling choice, not a neutral one — it assumes you're indifferent between a certain dollar now and a dollar of expected value later, once the dial has priced the uncertainty. If you're more risk-averse than that, lower the dial; that's what it's for.
-
-**What the score deliberately leaves out** is the future tax cost of the basis reduction. Every harvest lowers your replacement basis by exactly the loss taken, so the eventual sale owes `loss × future_rate` more — and HarvestIQ computes that for every step and shows it as `step_future_tax_cost` and `step_net_benefit`. It just doesn't *rank* on it. Ranking on net benefit sounds more honest and behaves worse: in the common same-rate case net benefit is near zero for every candidate, so the ordering degenerates again for the same reason savings-only does. The thrift tiebreaker below covers the practical concern — don't spend more basis than the benefit needed — while whether the deferral is worth taking at all stays a judgment call the user makes with the three numbers in front of them, rather than one the ranking quietly makes for them.
-
-**On greediness.** Taking the best step, applying it, and re-scoring is a heuristic, not a proof of optimality — the plan isn't searched over all orderings. What makes it defensible is that the value of a marginal dollar of harvested loss is non-increasing: each dollar consumes gains of its own character first, then cross-nets, then hits the $3,000 cap, then falls to carryforward. Re-scoring after every step is the part that matters, and it's the part a ranked list can't do.
-
-**Ties break toward thrift.** Equal scores prefer the lot that spends **less** unrealized loss, then a whole-lot sell over a partial one. This is the scarce-resource principle applied to ordering: when two harvests buy the same benefit, take the one that burns less of a resource you can never get back — and, all else equal, the one that's simpler to execute.
-
-**Where it stops.** The loop halts as soon as the best remaining score falls to `min_step_savings` (0 by default). Everything past that line still holds losses, but harvesting them buys nothing this year — so they're returned separately as `carryforward_only`, priced against the *post-plan* position, rather than padded into the plan as savings. Deferring those is a real choice, and lots with a seasoning deadline are flagged there specifically, because those are exactly the ones being left for next year.
-
-Note the two endpoints rank by different rules on purpose: `/harvest-opportunities` sorts by current-year savings then carryforward against a **static** position, while `/harvest-plan` re-scores every survivor against the position as it moves.
-
-### Sells are sized, not all-or-nothing
-
-Unrealized loss is a scarce, non-renewable resource — harvesting spends it permanently. Selling a $40,000 lot to capture $4,000 of benefit burns ten times what the job needed.
-
-The `carryforward_discount` dial (0–1) is how you tell the engine what banked carryforward is worth to you, and it moves the sell size continuously:
-
-```
-sized = useful_loss_budget + (full_lot_loss − useful_loss_budget) × discount
-```
-
-At **0** ("no gains coming") sells are sized to land exactly on the remaining useful-loss budget. At **1** ("big gain next year") it banks whole lots. At **0.3** it takes the budget plus 30% of the excess.
-
-### Which lot you sell is the whole trade
-
-**What a lot is.** Every purchase of a security is its own **tax lot**, with its own cost basis and its own purchase date. If you bought AAPL three times, you don't own "100 AAPL at an average price" for tax purposes — you own three separate lots, and a sale of 40 shares has to be attributed to specific ones. Which ones you pick determines the gain or loss you realize and whether it's short- or long-term. Same trade, same proceeds, different tax bill.
-
-**Why the default is the wrong one.** Absent an instruction, the IRS treats a sale as **first-in, first-out** — the oldest shares go first. In a position you've been adding to over time, the oldest shares are usually the cheapest, which means FIFO systematically sells your largest gain and your smallest loss. That is precisely backwards for harvesting: the default method is the one most hostile to the thing you're trying to do. Choosing a lot is not a micro-optimization on top of harvesting; **it is** harvesting.
-
-**Three methods**, on any sell via `lot_selection`:
-
-- `fifo` — oldest lot first. The IRS default, and what you get if you say nothing.
-- `hifo` — highest cost basis first, ties broken by age. Realizes the largest loss (or the smallest gain) per share sold; the sane default when you aren't targeting a particular lot.
-- `specific` — consume exactly the lots you name in `lot_ids`, in the order you give them. This is **specific identification**, the method the regulations actually contemplate, and the only one that lets a plan be executed as designed.
-
-That last one is why the plan is executable rather than advisory. Each step of `GET /harvest-plan` names a lot id and a quantity, and the dashboard's execute button fires that lot id straight back into `POST /transactions`. Reproducing a recommendation by hand in a broker interface usually falls back to FIFO — so you'd realize a different taxable result from the one that was valued. The advice would be correct and the outcome still wrong.
-
-**What the engine enforces.** Candidate lots are always filtered to *open* lots of that symbol **in that wallet** — sells are broker-scoped, so a lot at Fidelity can't satisfy a sale at Schwab. Specific ids are validated on all four counts (exists, right symbol, right wallet, still open) and rejected with a 400 rather than silently falling back. An oversell is refused before anything is written. And ordering always reads the real `opened_date`, never the wash-tacked holding-period date — tacking changes how a loss is *classified*, not which shares are physically oldest.
-
-### Wash sales are enforced, not flagged
-
-**The rule, plainly.** If you sell a security at a loss and buy the same — or a "substantially identical" — security within **30 days before or 30 days after** that sale, the IRS disallows the loss (IRC §1091). It is a 61-day window centered on the sale day, and buying *first* and selling *second* triggers it just as buying after does. The loss is not deducted this year, so the harvest you were counting on produces nothing.
-
-The loss is usually deferred rather than destroyed. The disallowed amount is added to the **cost basis of the replacement shares**, and the holding period of the shares you sold is **tacked onto** them — so you recover the deduction when you eventually sell the replacement, and you keep credit for the time already served toward long-term treatment. The exceptions are the ones that hurt: if the replacement is bought in an IRA or 401k there is no taxable basis to adjust and the loss is **gone for good** (Rev. Rul. 2008-5).
-
-Three details that catch people. The rule follows the **taxpayer**, not the account — your spouse's account and your IRA count, and no broker can see them, so no broker's 1099-B is complete. **Any** purchase counts, including ones you did not consciously make: a dividend reinvestment, an automated recurring buy, an option exercise. And it applies **only to losses** — selling at a gain and rebuying immediately is fine.
-
-**How HarvestIQ handles it.** Detection runs *before* the sale — replacement shares are computed from open lots inside the ±30-day window, net of shares that already absorbed a previous disallowed loss (a share can only block one harvest, never two). Fully liquidating a fresh buy is correctly **not** flagged.
-
-Enforcement runs at transaction time, in both directions. The disallowed loss doesn't vanish: it attaches to the replacement **shares** — basis up, holding period tacked back. Partial washes **split the replacement lot**, because Treas. Reg. §1.1091-1 matches share-by-share: sell 40 and rebuy 100 and the loss attaches to 40 of those shares, not pro-rata across all 100.
-
-**Across accounts**, which is the gap nothing mainstream covers. The wash-sale rule applies to the *taxpayer*; each broker only sees its own account. Register watch-only external accounts (a spouse's taxable account, an IRA, a 401k) and their purchases count toward the window. When the replacement lands in a retirement account the loss is **permanently destroyed** rather than deferred — there's no basis to adjust (Rev. Rul. 2008-5) — and HarvestIQ says so.
-
-Crypto is exempt (property, not a security, per Notice 2014-21).
-
-### What you buy back
-
-Harvesting is supposed to be **exposure-neutral**: you sell the loser, put the same dollars into something that behaves like it, and end the day with the same market position and a tax deduction you didn't have this morning. That assumption is doing real work — it's what makes "your basis drops by exactly the loss you harvested" true, and it's why harvesting can be described as a deferral rather than a bet. Reinvest less than the proceeds and you haven't just harvested a loss, you've also reduced your market exposure, and any return those dollars would have earned is a cost that appears in none of the tax numbers.
-
-**What the replacement's basis is.** Whatever you pay for it — nothing carries over from the lot you sold. Sell 100 AAPL for $15,000 and put all $15,000 into the replacement and the new basis is $15,000 (fees included); put in $10,000 and it's $10,000. Proceeds and basis coincide only because you reinvested in full, not because of any rule connecting them. The one exception is the wash sale, where the replacement's basis is what you paid **plus** the disallowed loss — which is exactly the mechanism that hands the deduction back to you later.
-
-**How suggestions work today — honestly, this is a stub.** `GET /replacement-suggestions` takes each harvest opportunity, reads the sold security's `sector`, and returns every other security in the system sharing that sector. That's the entire algorithm. It is a starting point for a human, not an answer:
-
-- **No "substantially identical" screening.** The suggestions are same-sector-different-symbol. Whether a given pair is substantially identical is the actual legal question, and the IRS has never defined the term — two S&P 500 index funds from different issuers are the canonical unresolved case. Nobody has solved this; HarvestIQ does not pretend to.
-- **No correlation or tracking-error screen.** Same sector is a crude proxy for "behaves like the thing I sold." A replacement that diverges from the original is a tracking bet you didn't intend to make.
-- **No sizing.** The endpoint returns symbols, never a dollar amount or share count, and never references the proceeds of the sale it's replacing. The exposure-neutrality the tax math assumes is left entirely to you, and nothing in the system verifies you maintained it.
-- **No window check.** Suggestions are not cross-referenced against the ±30-day window — that enforcement happens at transaction time, when you actually record the buy.
-
-Only the universe of securities already known to HarvestIQ is searched, so the quality of the suggestions is bounded by what you've told it about.
-
-### Warnings for the traps that actually bite people
-
-- **DRIP guard** — automatic dividend reinvestment is a purchase the wash-sale rule counts, and it's the single most common way people lose a harvested loss. If a distribution falls inside the ±30-day window, you get told to turn reinvestment off *before* selling.
-- **Seasoning deadline** — a short-term loss that crosses its one-year anniversary becomes long-term and is usually worth less. HarvestIQ prices the difference and only warns when waiting actually costs money. (It often doesn't: with only short-term gains on the books, a long-term loss cross-nets into them at the short rate anyway.)
-- **Harvest capacity** — how much harvestable loss is *left*, and how far each position must fall before it offers anything. Repeated harvesting ratchets basis down until a portfolio is ossified: still holding losses on paper, but nothing takeable without a serious drawdown.
-
-### Per-wallet cost basis
-
-Universal pooled basis for crypto is dead. Rev. Proc. 2024-28 and Treas. Reg. §1.1012-1(j) made wallet-by-wallet basis **mandatory** for tax years beginning after 2024-12-31. HarvestIQ enforces it end-to-end: a sale can only draw on lots actually held in that wallet, and `POST /transfers` moves lots between wallets carrying basis and dates without realizing anything.
+The processes don't share memory. They communicate only through Redis (messages, task queue, cached results) and Postgres (persistent state), so each one can be restarted independently. Imports point one way only: `main.py → celery_app.py → harvest.py → model.py`.
 
 ---
 
-## Features
+## Live price updates
 
-- **Ordered harvest plan** — sequenced, sized, with saves-now / costs-later / net on every step and two-click execute buttons.
-- **Real netting waterfall** — ST/LT character, cross-netting, $3,000 cap, character-preserving carryforwards.
-- **Wash-sale enforcement** — basis adjustment, holding-period tacking, lot splitting, spent-share tracking, cross-account and retirement-account scope.
-- **Harvest capacity** — the remaining pool of unrealized loss, plus per-position drawdown-to-harvest.
-- **Seasoning + DRIP warnings** — priced, not generic.
-- **Multi-wallet** — accounts registry, basis-preserving transfers, per-wallet basis (Rev. Proc. 2024-28).
-- **[Lot selection](#which-lot-you-sell-is-the-whole-trade)** — FIFO, HIFO, or specific identification by lot id on any sell, wallet-scoped and validated.
-- **Tax-lot tracking** — every purchase is its own lot with fee-inclusive cost basis and an oversell guard.
-- **Live market data** — prices stream over a Finnhub websocket; the dashboard updates itself over its own websocket.
-- **Price history** — 90-day daily bars from Yahoo Finance, Redis-cached.
-- **AI explanations** — natural-language walkthrough of the plan via the Groq API.
-- **Dashboard** — single-page UI: plan hero panel, capacity tiles, holdings, opportunities with wash/DRIP/seasoning badges, realized-gains log with washed amounts, settings, wallets and transfers.
+**Ingestion.** The streamer keeps a persistent websocket connection to Finnhub and subscribes to every security in the database. The `on_message` handler writes each trade's price into an in-memory dict and does nothing else, so no database I/O happens on the socket's read loop.
+
+**Persistence.** A background thread runs once a second. It compares the dict against the last values it wrote and issues `UPDATE`s only for symbols whose price changed. If anything changed, it publishes a message on the Redis `prices` channel. The message carries no prices. Subscribers read the current values from Postgres, so the database is the only source of price data.
+
+**Broadcast.** At startup, the web server's ASGI `lifespan` opens a single Redis subscription and starts two tasks:
+
+- a **listener**, which sets an `asyncio.Event` whenever a message arrives;
+- a **broadcaster**, which waits on that event, clears it, builds the portfolio summary in a threadpool (the DB access is synchronous), sends it to all connected clients concurrently, then sleeps for a minimum interval (2s by default).
+
+Since the event is a flag, any number of messages arriving during the sleep produce a single update. The summary is computed once per update regardless of how many clients are connected, and not at all when none are. The `/ws/prices` handler only registers the client, sends the current summary on connect, and waits on `receive()` to detect disconnects.
+
+The event is created inside `lifespan` rather than at import time, because an `asyncio.Event` binds to the event loop that first awaits it. On shutdown, `lifespan` cancels and awaits both tasks, then closes the subscription and the Redis connection.
+
+**Connection failures:**
+
+| Failure | Handling |
+| --- | --- |
+| Finnhub connection drops | `run_forever(reconnect=5)` reconnects. Subscriptions belong to the connection, so `on_open` clears local state and re-subscribes every symbol. |
+| Half-open connection | Ping every 20s with a 10s pong timeout. |
+| Security added at runtime | New symbols are subscribed every 60s. Subscribing is idempotent. |
+| Browser closes the tab | ASGI delivers the disconnect as a receive event, and the handler removes the client. |
+| Slow or stalled client | Each send has a 5s timeout. Clients that exceed it are dropped. |
+| Dashboard loses its socket | The client reconnects after 2s and receives the current summary immediately. |
 
 ---
 
-## Tech stack
+## Background processing
 
-- **Backend:** FastAPI, SQLAlchemy, PostgreSQL
-- **Async:** Redis (broker + cache + pub/sub) and Celery
-- **Migrations:** Alembic
-- **Market data:** Finnhub websocket for live prices and spot quotes; yfinance for historical daily bars only (Finnhub's candle endpoints are premium). Every outbound call goes through `app/prices.py`.
-- **AI:** Groq API (`openai/gpt-oss-20b`)
-- **Frontend:** vanilla HTML/JS + Chart.js (served by FastAPI)
-- **Tests:** pytest + FastAPI TestClient (in-memory SQLite)
+Celery runs with Redis as both broker and result backend. There are two tasks, and they use different patterns.
+
+**`run_tax_analysis` (compute and cache).** This task loads all open lots, computes harvest opportunities and the sequenced plan, and writes the result to the Redis key `tax_analysis`. The streamer enqueues it every 30 seconds, and `POST /tax-analysis/run` triggers it on demand. All reads (`GET /tax-analysis`, `GET /portfolio-summary`, and the websocket push) use the cache and never recompute. If the cache is empty, `GET /tax-analysis` returns `503`.
+
+**`generate_harvest_explanation` (poll by job id).** `POST /harvest-explanations` enqueues an LLM call and returns `202 Accepted` with the job id and a `Location: /jobs/{id}` header. The client polls `GET /jobs/{id}`, which reads the task state from the result backend. The endpoint is a `POST` because each call costs money and should never be triggered by a prefetch or a retry.
+
+Celery's JSON serializer can't encode `Decimal`. Tax rates are passed to tasks as strings and converted back inside the task, and cached results are encoded with `default=str`.
 
 ---
 
-## How it works
+## Market data
 
+`app/prices.py` is the only module that calls external market-data APIs. Every request has a 5s timeout and one retry with exponential backoff. Vendor failures raise `PriceUnavailable`, which the API returns as `502`.
+
+Finnhub supplies live prices (websocket and REST `/quote`), and yfinance supplies historical daily bars. History is cached in Redis under `price_history:{symbol}:{days}` for one hour, and empty results are cached for 60s so a bad symbol doesn't call the vendor on every request. The two vendors use different symbols for the same instrument (`BINANCE:BTCUSDT` vs `BTC-USD`), so each security stores a canonical symbol and an optional history-vendor override.
+
+---
+
+## Data model
+
+- **SQLAlchemy models are the schema definition.** Each table is a typed class in `app/model.py` (`Mapped[...]` columns), and every money and quantity column is `Numeric(20, 8)`, which reads back as Python `Decimal`.
+- **Alembic turns model changes into migrations.** `alembic/env.py` points `target_metadata` at the models' `Base.metadata`, so `alembic revision --autogenerate` diffs the models against the live database and writes a versioned migration script. That gives 11 migrations in one linear chain.
+- **PostgreSQL is only ever changed by migrations.** `alembic upgrade head` applies them in order, and the app never calls `create_all` against Postgres.
+- **The app reaches Postgres through one engine per process.** `app/database.py` builds the engine and connection pool from `DATABASE_URL` and hands out sessions. The ORM turns queries into SQL, and inserts and updates are committed as one transaction per unit of work.
+- **Tests skip Alembic.** They point the same models at in-memory SQLite and build the schema with `Base.metadata.create_all`.
+
+```mermaid
+erDiagram
+    transactions ||--o{ tax_lots : "BUY opens"
+    transactions ||--o{ realized_gains : "SELL produces"
+    tax_lots ||--o{ realized_gains : "consumed by"
+    external_accounts ||--o{ external_activities : has
+    securities ||..o{ tax_lots : "symbol"
+    accounts ||..o{ tax_lots : "broker (wallet)"
+    accounts ||..o{ transfers : "from / to"
+    accounts ||..o{ transactions : "broker (wallet)"
+
+    transactions {
+        int id PK
+        string symbol
+        string transaction_type
+        numeric quantity
+        numeric price
+        numeric fees
+        date trade_date
+        string broker
+    }
+    tax_lots {
+        int id PK
+        int open_transaction_id FK
+        string symbol
+        string broker
+        numeric quantity_opened
+        numeric quantity_remaining
+        numeric cost_basis_per_unit
+        date opened_date
+        date holding_period_date
+        string status
+        numeric wash_replacement_used
+    }
+    realized_gains {
+        int id PK
+        int sell_transaction_id FK
+        int lot_id FK
+        numeric proceeds
+        numeric cost_basis
+        numeric gain_loss
+        numeric disallowed_wash_loss
+        string term
+        date sell_date
+    }
+    securities {
+        int id PK
+        string symbol UK
+        string history_symbol
+        string sector
+        numeric latest_price
+        bool drip_enabled
+    }
+    accounts {
+        int id PK
+        string name UK
+        string kind
+    }
+    transfers {
+        int id PK
+        string symbol
+        numeric quantity
+        string from_account
+        string to_account
+    }
+    external_accounts {
+        int id PK
+        string name
+        string account_type
+    }
+    external_activities {
+        int id PK
+        int account_id FK
+        string symbol
+        numeric quantity
+        date trade_date
+        numeric replacement_used
+    }
+    tax_settings {
+        int id PK
+        numeric carryforward_st
+        numeric carryforward_lt
+        numeric expected_future_lt_rate
+        numeric carryforward_discount
+    }
 ```
-transactions ─▶ validation ─▶ security master
-     │
-     ▼
-  tax lots ─▶ FIFO / HIFO / specific-lot consumption
-     │              │
-     │              ▼
-     │        wash-sale ENFORCEMENT (basis + tacking + lot split,
-     │        across internal, external and retirement accounts)
-     │              │
-     ▼              ▼
- live prices ─▶ realized gains (tax-reportable, washes applied)
-     │
-     ▼
- unrealized ─▶ netting waterfall ─▶ per-lot opportunities
-                                          │
-                     DRIP + seasoning ────┤
-                                          ▼
-                              sequenced harvest PLAN
-                        (sized to the useful-loss budget)
-                                          │
-                    ┌─────────────────────┼─────────────────────┐
-                    ▼                     ▼                     ▼
-            harvest capacity      AI explanation           dashboard
-           (what's left to
-            harvest, ever)
-```
 
-Import direction is one-way and must stay that way:
-`main.py → celery_app.py → harvest.py → model.py`
+Solid lines are foreign keys. Dotted lines are joins on a natural key (`symbol`, wallet name). `tax_settings` is a single-row table with no relationships.
+
+How each process uses it:
+- **Web:** session per request via a FastAPI dependency. The broadcaster opens its own session in a threadpool.
+- **Streamer:** writes changed prices, commits, then publishes to Redis.
+- **Worker:** bulk-loads lots and securities (no per-lot queries) and writes results to Redis.
+
+| Table | Purpose |
+| --- | --- |
+| `transactions` | Every buy and sell as recorded |
+| `securities` | Security master: symbol, history symbol, sector, latest price, dividend/DRIP settings |
+| `tax_lots` | One row per purchase: quantity remaining, cost basis per unit, purchase date, holding-period date, wallet |
+| `realized_gains` | One row per lot consumed by a sell: proceeds, basis, gain/loss, disallowed wash-sale loss |
+| `accounts`, `transfers` | Wallets/brokerages, and lot moves between them that keep basis and dates |
+| `external_accounts`, `external_activities` | Watch-only accounts (IRA, spouse) that count toward wash-sale windows |
+| `tax_settings` | Carryforwards and planning parameters |
+
+**Processing a sell.** `process_transaction` selects candidate lots for the symbol in the selling wallet (FIFO, HIFO, or the specific lot ids requested). It validates them and rejects an oversell, consumes the lots, writes one `realized_gains` row per lot, and applies any wash-sale basis adjustments to replacement lots. Intermediate steps use `flush()`, and everything is committed once at the end, so a sell either applies fully or not at all.
 
 ---
 
-## Setup
+## API
 
-**Prerequisites:** Python 3.9+, PostgreSQL and Redis running locally, a free [Finnhub API key](https://finnhub.io/register), and a free [Groq API key](https://console.groq.com).
+The OpenAPI documentation is served at `/docs`.
+
+- Creation returns `201`. Enqueued work returns `202` with a `Location` header.
+- Errors use `{"detail": ...}`: `400` for invalid input such as unknown or closed lot ids, `502` for vendor failures, `503` for a cold cache.
+- Money and quantities are serialized as strings.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /harvest-plan` | Ordered, sized harvest plan |
+| `GET /harvest-opportunities` | Per-lot opportunities with wash-sale / DRIP / seasoning flags |
+| `GET /harvest-capacity` | Remaining harvestable loss |
+| `POST /tax-analysis/run` · `GET /tax-analysis` | Enqueue a recompute / read the cache |
+| `POST /harvest-explanations` · `GET /jobs/{id}` | Enqueue an LLM explanation / poll a job |
+| `POST /transactions` · `POST /transactions/market` | Record a buy or sell |
+| `GET /tax-lots` · `GET /realized-gains` | Lot and realized-gain records |
+| `GET /portfolio` · `GET /portfolio-summary` | Holdings and summary totals |
+| `WS /ws/prices` | Live summary updates |
+| `/accounts` · `/transfers` · `/external-accounts` | Wallets, transfers, watch-only accounts |
+| `/securities` · `GET /price-history/{symbol}` | Security master and price history |
+| `GET` / `PUT /tax-settings` | Tax settings |
+
+---
+
+## Frontend
+
+The dashboard is a single static page (`static/index.html`) written in vanilla JavaScript with no build step, served by FastAPI at `/dashboard`. Everything runs in the browser and talks to the backend over the same REST API and websocket documented above.
+
+- **Initial load:** fetches each panel (plan, holdings, opportunities, realized gains, wallets, settings) from its own REST endpoint and renders it into the DOM. Values from the server are HTML-escaped before they are inserted.
+- **Live updates:** opens a websocket to `/ws/prices` and repaints the summary from each pushed message, with no refetch. If the socket closes, it reconnects after 2s.
+- **Executing a plan step:** each step has a two-click sell button (the first click arms it, the second sends). It posts a specific-lot market sell with the exact lot id from the plan, then triggers a recompute and reloads the panels from the cache.
+- **AI explanation:** posts to `/harvest-explanations`, then polls `GET /jobs/{id}` every 1.5s until it sees `SUCCESS` or `FAILURE`, giving up after about 60s.
+- **Charts:** Chart.js renders 90-day price history from `GET /price-history/{symbol}`, which is cached in Redis.
+- **Settings:** the tax rates entered in the page are passed as query parameters on every analysis request, and settings forms write back through `PUT /tax-settings`.
+
+---
+
+## Configuration
+
+| Variable | Default | Used by |
+| --- | --- | --- |
+| `DATABASE_URL` | `postgresql://localhost/harvestiq` | All processes (SQLAlchemy engine) |
+| `REDIS_URL` | `redis://localhost:6379/0` | Web server and market-data layer |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` / `DB_POOL_TIMEOUT` | `10` / `20` / `10` | Connection pool sizing |
+| `WS_MIN_PUSH_INTERVAL` | `2` | Minimum seconds between websocket pushes |
+| `FINNHUB_API_KEY` | none | Streamer and spot quotes |
+| `GROQ_API_KEY` | none | Worker (LLM explanations) |
+
+The Celery broker URL in `app/celery_app.py` is currently fixed to the local Redis and doesn't read `REDIS_URL`.
+
+---
+
+## Testing
 
 ```bash
-# 1. Clone and enter the project
-git clone https://github.com/mtjia6/harvestiq.git
-cd harvestiq
+python3 -m pytest -q
+```
 
-# 2. Create and activate a virtual environment
-python3 -m venv venv
-source venv/bin/activate
+- `tests/test_engine.py` has 63 tests. They use FastAPI's `TestClient` against in-memory SQLite and cover lot selection, netting, wash-sale enforcement, plan generation, transfers, and request validation.
+- `tests/test_ws_prices.py` has 5 tests and requires Redis. They check that a price change triggers a push, that one computation serves multiple clients, that bursts are merged into one push, that no work happens when nobody is connected, and that disconnected clients are removed.
 
-# 3. Install dependencies
+---
+
+## Running locally
+
+Requires Python 3.9+, PostgreSQL, Redis, and API keys for [Finnhub](https://finnhub.io/register) and [Groq](https://console.groq.com).
+
+```bash
+git clone https://github.com/mtjia6/harvestiq.git && cd harvestiq
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-# 4. Create the database
 createdb harvestiq
-
-# 5. Add your API keys
 cat > .env <<'ENV'
 GROQ_API_KEY=your_key_here
 FINNHUB_API_KEY=your_key_here
 ENV
 
-# 6. Create the schema
 alembic upgrade head
-
-# 7. Run the stack — web + worker + streamer in one terminal
-honcho start
-
-# 8. Seed the tax cache once
-curl -X POST localhost:8000/tax-analysis/run
+honcho start                                   # web + worker + streamer (Procfile)
+curl -X POST localhost:8000/tax-analysis/run   # populate the analysis cache
+python3 seed.py                                # optional demo portfolio
 ```
 
-`honcho start` reads the `Procfile`. To run the processes separately instead:
+Dashboard: http://127.0.0.1:8000/dashboard · API docs: http://127.0.0.1:8000/docs
 
-```bash
-uvicorn app.main:app --reload
-celery -A app.celery_app:celery_app worker --loglevel=info --pool=solo
-python -m app.price_stream          # live Finnhub price feed
-```
-
-> On macOS the Celery worker must run with `--pool=solo` (fork-safety segfaults otherwise).
-
-Then open the dashboard at **http://127.0.0.1:8000/dashboard** and the interactive API docs at **http://127.0.0.1:8000/docs**.
-
-### API conventions
-
-- Writes return **201** with the created resource; endpoints that enqueue background work return **202** with a job id and a `Location` header pointing at `/jobs/{id}`.
-- Money and quantities cross the wire as **strings**, so no client can silently round them through a float.
-- Errors use FastAPI's `{"detail": ...}` shape throughout.
-
-### Load demo data (optional)
-
-With the server running, in a second terminal:
-
-```bash
-python3 seed.py
-```
-
-This creates a diversified sample portfolio (equities + crypto across several sectors) and pulls live prices, so the dashboard has realistic data to show.
+On macOS the worker runs with `--pool=solo`, because the default prefork pool crashes there.
 
 ---
 
-## Key API endpoints
+## Limitations
 
-### Tax analysis
+- No authentication. All data belongs to a single shared user.
+- Sells don't lock lot rows, so two concurrent sells of the same lot can both pass validation.
+- The periodic recompute is a loop in the streamer process, not Celery Beat.
+- Engine tests run on SQLite rather than Postgres.
+- Tax rates are flat and user-supplied. See [docs/TAX_ENGINE.md](docs/TAX_ENGINE.md#tax-model-limitations).
 
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /harvest-plan` | **The main one.** Ordered, sized, sequentially-priced plan |
-| `GET /harvest-opportunities` | Per-lot view with wash / DRIP / seasoning flags |
-| `GET /harvest-capacity` | Harvestable loss remaining + per-position drawdown-to-harvest |
-| `GET /wash-sales` | Enforced wash-sale records with disallowed amounts |
-| `GET` / `PUT /tax-settings` | Carryforwards, expected future rate, carryforward dial |
-| `GET /replacement-suggestions` | Same-sector alternatives per opportunity — a [stub](#what-you-buy-back): symbols only, no sizing, no identicality screen |
-| `POST /harvest-explanations` | Enqueue an AI-written harvest summary (202 + job id) |
-| `POST /tax-analysis/run` · `GET /tax-analysis` | Recompute / serve the cached analysis |
-
-### Transactions, lots and portfolio
-
-| Endpoint | Purpose |
-| --- | --- |
-| `POST /transactions` | Record a buy/sell (`lot_selection`: `fifo` \| `hifo` \| `specific`) |
-| `POST /transactions/market` | Buy/sell at the current live price |
-| `GET /tax-lots` | All tax lots, including tacked `holding_period_date` |
-| `GET /realized-gains` | Tax-reportable gain/loss + `disallowed_wash_loss` |
-| `GET /portfolio` · `GET /unrealized-gains` | Holdings and open-lot P&L |
-| `GET /portfolio-summary` | Headline totals, plan savings, capacity |
-| `WS /ws/prices` | Live summary pushed on each price change |
-
-### Wallets, external accounts and securities
-
-| Endpoint | Purpose |
-| --- | --- |
-| `POST` / `GET /accounts` | Wallet / brokerage / exchange registry |
-| `POST` / `GET /transfers` | Inter-wallet moves that carry basis and realize nothing |
-| `POST` / `GET /external-accounts` (+ `/activities`) | Watch-only accounts for cross-account wash sales |
-| `POST` / `GET /securities` · `POST /securities/{symbol}/price` | Security master and prices |
-| `PUT /securities/{symbol}/dividends` | DRIP flag and next dividend date |
-| `GET /price-history/{symbol}` | 90-day price history for charts (Redis-cached) |
-| `GET /jobs/{job_id}` | Poll a background job |
-
----
-
-## Running the tests
-
-```bash
-python3 -m pytest -v
-```
-
-68 tests. They cover the netting waterfall and its edge cases (the $3,000 cap, net-loss years where an extra harvest saves nothing, character preservation), wash-sale enforcement (basis adjustment, holding-period tacking, lot splitting on partial washes, spent replacement shares, cross-account and retirement-account cases), plan sequencing and sell sizing across the carryforward dial, harvest capacity, seasoning deadlines, per-wallet basis through transfers, and the crypto exemption.
-
-`tests/test_ws_prices.py` needs a live Redis; `tests/test_engine.py` runs standalone on in-memory SQLite.
-
----
-
-## Known limitations
-
-The honest split: **the harvesting logic is rigorous, the tax rate model is a stated simplification.** The machinery for producing a defensible answer is there and it's fed a rate you type in. That rate can be wrong by a factor of two or three in either direction, and everything downstream inherits the error. Treat `estimated_tax_savings` as *directionally* sound and the dollar figure as indicative.
-
-**Rate modelling (the big one):**
-
-- **Flat rates, no brackets.** You supply a short- and long-term rate. There's no bracket stacking and no 0% / 15% / 20% breakpoints. If your income puts you in the **0% long-term band**, HarvestIQ will tell you a long-term harvest saves 15% when it saves nothing — and it's worse than nothing, because you've ratcheted basis down against a future taxable gain.
-- **No NIIT.** The 3.8% surtax isn't modelled, and its treatment of capital losses is unintuitive (net losses count against net investment income only up to the same $3,000).
-- **No §1(h) rate groups.** Collectibles at 28% (including physical-metal ETFs like GLD and SLV) and unrecaptured §1250 at 25% are treated as ordinary long-term.
-- **No AMT, no state tax.** Pennsylvania in particular has no carryforward, no $3,000 offset, no ST/LT distinction — and the federal wash-sale rules don't apply for PA personal income tax. New Jersey has no carryforward either.
-- **No cliff modelling.** IRMAA, ACA subsidy cliffs and Social Security's provisional-income phase-in all interact with capital losses and none are represented.
-
-**Scope and mechanics:**
-
-- **Not multi-user** — no authentication; all data is shared. This is the blocker to being genuinely real.
-- **Carryforward has no present value or mortality discount.** It's reported honestly as separate from current-year savings, but a dollar banked for a user with no foreseeable gains is worth much less than face — and unused carryforwards expire at death (Rev. Rul. 74-175).
-- **"Substantially identical" is not solved.** Replacement suggestions are same-sector-different-symbol, with no correlation or tracking-error screening. Nobody has solved this; the IRS has never defined the term.
-- **The mandatory-use trap isn't caught.** §1211(b) requires the loss to be used to the maximum extent in the current year — there's no election to defer. A taxpayer with no gains and income below the standard deduction destroys $3,000 of carryforward for nothing, and HarvestIQ will still recommend the harvest.
-- **Some hidden costs aren't modelled:** the §852(b)(4)(A) six-month rule (a capital gain distribution recharacterizes a short-term loss as long-term), the 61-day qualified-dividend rule under §246(c), and return-of-capital distributions reducing basis under §301(c)(2).
-- **Special regimes invalidate the engine entirely** for some users: a §475(f) mark-to-market trader is exempt from §1091 and has no $3,000 cap; §1092 straddles and §1259 constructive sales aren't handled.
-- **Crypto:** wallet-by-wallet basis is enforced, but the pre-2025 safe-harbor allocation isn't modelled, and crypto ETPs (which *are* securities and *do* get §1091) aren't yet distinguished from spot crypto in the schema.
-- **Transfer fees** aren't added to basis; currency is stored but unused in P&L.
-- Tests run on SQLite rather than Postgres.
-
----
-
-## Disclaimer
-
-HarvestIQ provides general information for educational purposes only. It is **not** personalized tax, legal, or financial advice. Consult a qualified professional before making investment or tax decisions.
+*Educational project. Not tax, legal, or financial advice.*
