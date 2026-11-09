@@ -1,14 +1,14 @@
-fastapi==0.142.2
+fastapi==0.162.0
 groq==1.7.0
-pydantic==2.13.5
+pydantic==2.14.3
 uvicorn==0.54.0
-alembic==1.20.0
-SQLAlchemy==2.1.1
+alembic==1.20.1
+SQLAlchemy==2.1.8
 psycopg2-binary==2.9.13
 python-dotenv==1.2.4
-pytest==9.1.1
+pytest==9.2.0
 httpx==0.28.1
-celery[redis]==5.6.3
+celery[redis]==5.7.0
 # Imported directly by app/celery_app.py and app/prices.py, so pin it
 # explicitly rather than relying on celery[redis] to pull it in.
 redis==8.1.0
@@ -19,4 +19,4 @@ websocket-client==1.9.2
 requests==2.34.2
 # Historical daily bars ONLY -- Finnhub's candle endpoints are premium.
 # Not reachable from any request handler; see app/prices.py.
-yfinance==1.7.0
+yfinance==1.8.0
